@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ƜackDown — Markdown, turned on its head</title>
+<meta name="description" content="A 3 MB Markdown viewer for Windows that opens before you finish double-clicking. No browser inside, no account, no sidebar that wants to be your friend.">
+<meta property="og:title" content="ƜackDown">
+<meta property="og:description" content="Markdown, turned on its head. A native Windows viewer with nothing in it but the viewer.">
+<meta property="og:image" content="https://bezkom.github.io/wackdown/img/theme-cyberpunk-terminal.png">
+<link rel="icon" href="img/icon.svg" type="image/svg+xml">
+<link rel="icon" href="img/icon.png" sizes="256x256">
+<style>
+@font-face { font-family: "Iosevka Aile"; src: url(fonts/IosevkaAile-Regular.ttf) format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Iosevka Aile"; src: url(fonts/IosevkaAile-Bold.ttf) format("truetype"); font-weight: 700; font-display: swap; }
+@font-face { font-family: "Iosevka"; src: url(fonts/Iosevka-Regular.ttf) format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Iosevka"; src: url(fonts/Iosevka-Bold.ttf) format("truetype"); font-weight: 700; font-display: swap; }
+@font-face { font-family: "Iosevka Etoile"; src: url(fonts/IosevkaEtoile-Bold.ttf) format("truetype"); font-weight: 700; font-display: swap; }
+
+:root {
+  color-scheme: dark;
+  --bg: #090a0f; --bg-2: #0e1018; --bg-3: #141726; --line: #21243d;
+  --text: #d8e2ed; --dim: #7c879a; --amber: #ffb400; --cyan: #00f0ff; --pink: #ff0055; --green: #39ff88;
+  --sans: "Iosevka Aile", "Segoe UI", system-ui, sans-serif;
+  --mono: "Iosevka", "Cascadia Mono", Consolas, monospace;
+  --serif: "Iosevka Etoile", Georgia, serif;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.65 var(--sans); }
+a { color: var(--cyan); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+h1, h2, h3 { font-family: var(--mono); line-height: 1.15; letter-spacing: -0.01em; margin: 0 0 .5em; }
+h2 { font-size: clamp(1.6rem, 3.5vw, 2.3rem); color: var(--cyan); }
+h2 .hash { color: var(--dim); margin-right: .35em; font-weight: 400; }
+h3 { font-size: 1.1rem; color: var(--amber); }
+code, kbd, .mono { font-family: var(--mono); }
+code { background: var(--bg-3); border: 1px solid var(--line); border-radius: 4px; padding: .05em .4em; font-size: .92em; }
+kbd { display: inline-block; min-width: 1.9em; text-align: center; background: linear-gradient(#1b1f33, #11131f); border: 1px solid #2d3252; border-bottom-width: 3px; border-radius: 6px; padding: .1em .5em; font-size: .85em; color: var(--text); white-space: nowrap; }
+section { padding: 72px 20px; }
+.wrap { max-width: 1040px; margin: 0 auto; }
+.narrow { max-width: 760px; margin: 0 auto; }
+.dim { color: var(--dim); }
+.btn { display: inline-flex; align-items: center; gap: .5em; font-family: var(--mono); font-weight: 700; padding: .75em 1.3em; border-radius: 8px; text-decoration: none; border: 1px solid transparent; transition: transform .12s ease, box-shadow .12s ease; }
+.btn:hover { transform: translateY(-2px); }
+.btn-primary { background: var(--amber); color: #0b0a05; }
+.btn-primary:hover { box-shadow: 0 6px 24px rgba(255,180,0,.35); }
+.btn-ghost { border-color: var(--line); color: var(--text); background: var(--bg-2); }
+
+/* Hero */
+.hero { padding: 90px 20px 50px; text-align: center; position: relative; overflow: hidden; }
+.hero::before { content: ""; position: absolute; inset: -40% -20% auto; height: 120%; background: radial-gradient(60% 50% at 50% 30%, rgba(0,240,255,.10), transparent 70%), radial-gradient(40% 40% at 70% 20%, rgba(255,180,0,.10), transparent 70%); pointer-events: none; }
+.hero > * { position: relative; }
+.logo { font-family: var(--sans); font-weight: 700; font-size: clamp(3.4rem, 11vw, 7.5rem); letter-spacing: -0.03em; line-height: 1; margin: 0; color: var(--amber); display: inline-flex; align-items: baseline; }
+.logo .m { display: inline-block; transform-origin: 50% 56%; animation: flip 1.1s cubic-bezier(.3,1.4,.4,1) .5s both; }
+@keyframes flip { from { transform: rotate(0deg); } to { transform: rotate(180deg); } }
+.logo .arrow { color: var(--cyan); font-size: .7em; margin-left: .08em; animation: drop .6s ease 1.5s both; }
+@keyframes drop { from { opacity: 0; transform: translateY(-.4em); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .logo .m { animation: none; transform: rotate(180deg); } .logo .arrow { animation: none; } .btn:hover { transform: none; } }
+.tagline { font-family: var(--serif); font-weight: 700; font-size: clamp(1.4rem, 3.4vw, 2.1rem); color: var(--text); margin: .6em 0 .3em; }
+.sub { max-width: 640px; margin: 0 auto 1.8em; color: var(--dim); font-size: 1.08rem; }
+.cta { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+.release { margin-top: 14px; font-family: var(--mono); font-size: .85rem; color: var(--dim); }
+.release b { color: var(--green); }
+
+/* Screenshot + theme gallery */
+.shot { margin: 40px auto 0; max-width: 1000px; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--bg-2); box-shadow: 0 30px 80px rgba(0,0,0,.6); }
+.shot .bar { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: .8rem; color: var(--dim); }
+.shot .bar i { width: 11px; height: 11px; border-radius: 50%; background: #2a2f49; display: inline-block; }
+.shot .bar i:first-child { background: var(--pink); }
+.shot img { display: block; width: 100%; height: auto; }
+.themes { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 16px; }
+.themes button { font-family: var(--mono); font-size: .85rem; color: var(--text); background: var(--bg-2); border: 1px solid var(--line); border-radius: 999px; padding: .4em .9em .4em .6em; cursor: pointer; display: inline-flex; align-items: center; gap: .5em; }
+.themes button i { display: inline-flex; gap: 3px; }
+.themes button i b { width: 10px; height: 10px; border-radius: 50%; display: inline-block; border: 1px solid rgba(255,255,255,.2); }
+.themes button[aria-pressed="true"] { border-color: var(--amber); color: var(--amber); }
+.gallery-hint { text-align: center; font-size: .9rem; margin-top: 10px; }
+
+/* Nutrition label */
+.label { font-family: var(--mono); border: 2px solid var(--text); padding: 8px 12px; max-width: 360px; margin: 48px auto 0; text-align: left; background: var(--bg-2); border-radius: 4px; }
+.label h3 { font-size: 1.6rem; color: var(--text); margin: 0; border-bottom: 8px solid var(--text); padding-bottom: 2px; }
+.label .row { display: flex; justify-content: space-between; border-bottom: 1px solid var(--line); padding: 3px 0; font-size: .92rem; }
+.label .row.thick { border-bottom: 4px solid var(--text); }
+.label .fine { font-size: .75rem; color: var(--dim); padding-top: 6px; line-height: 1.4; }
+
+/* Timeline */
+.timeline { list-style: none; padding: 0; margin: 0; border-left: 2px solid var(--line); }
+.timeline li { padding: 0 0 26px 26px; position: relative; }
+.timeline li::before { content: ""; position: absolute; left: -8px; top: .5em; width: 14px; height: 14px; border-radius: 50%; background: var(--bg); border: 2px solid var(--line); }
+.timeline li:last-child::before { border-color: var(--amber); background: var(--amber); box-shadow: 0 0 18px var(--amber); }
+.timeline .year { font-family: var(--mono); color: var(--amber); font-weight: 700; }
+.timeline .t { font-family: var(--mono); color: var(--cyan); }
+
+/* Grids */
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+.card { background: var(--bg-2); border: 1px solid var(--line); border-radius: 12px; padding: 22px; }
+.card h3 { margin-top: 0; }
+.card p { margin: 0; color: #b8c2d0; }
+
+/* Never list */
+.never { list-style: none; padding: 0; margin: 0; columns: 2; column-gap: 32px; }
+.never li { break-inside: avoid; padding: 6px 0 6px 34px; position: relative; color: #b8c2d0; }
+.never li::before { content: "✕"; position: absolute; left: 0; top: 7px; width: 22px; height: 22px; border: 2px solid var(--pink); border-radius: 5px; color: var(--pink); font-family: var(--mono); font-weight: 700; font-size: .95rem; line-height: 20px; text-align: center; }
+@media (max-width: 640px) { .never { columns: 1; } }
+
+/* Weight chart */
+.bars { display: grid; gap: 12px; }
+.bar-row { display: grid; grid-template-columns: minmax(150px, 230px) 1fr auto; align-items: center; gap: 12px; font-size: .95rem; }
+.bar-row .fill { height: 18px; border-radius: 4px; background: var(--line); position: relative; overflow: hidden; }
+.bar-row .fill i { position: absolute; inset: 0 auto 0 0; background: var(--cyan); border-radius: 4px; width: var(--w); }
+.bar-row.us .fill i { background: var(--amber); box-shadow: 0 0 14px var(--amber); }
+.bar-row .n { font-family: var(--mono); color: var(--dim); white-space: nowrap; }
+.bar-row.us .n { color: var(--amber); font-weight: 700; }
+@media (max-width: 560px) { .bar-row { grid-template-columns: 1fr auto; } .bar-row .fill { grid-column: 1 / -1; } }
+
+/* Keys */
+.keys { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px 32px; }
+.keys div { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px dashed var(--line); }
+.keys span:last-child { white-space: nowrap; }
+
+/* FAQ */
+details { border-bottom: 1px solid var(--line); padding: 14px 0; }
+summary { cursor: pointer; font-family: var(--mono); font-weight: 700; color: var(--text); list-style: none; display: flex; justify-content: space-between; gap: 12px; }
+summary::-webkit-details-marker { display: none; }
+summary::after { content: "+"; color: var(--amber); }
+details[open] summary::after { content: "−"; }
+details p { margin: 10px 0 0; color: #b8c2d0; }
+
+/* Install */
+.steps { counter-reset: s; list-style: none; padding: 0; margin: 0; }
+.steps li { counter-increment: s; position: relative; padding: 0 0 18px 48px; }
+.steps li::before { content: counter(s); position: absolute; left: 0; top: 0; width: 32px; height: 32px; border-radius: 50%; background: var(--amber); color: #0b0a05; font-family: var(--mono); font-weight: 700; display: grid; place-items: center; }
+.smart { border: 1px solid var(--amber); border-left-width: 4px; border-radius: 8px; padding: 14px 18px; background: rgba(255,180,0,.06); margin-top: 18px; }
+
+footer { padding: 50px 20px 70px; text-align: center; color: var(--dim); font-size: .9rem; border-top: 1px solid var(--line); }
+footer p { margin: .4em 0; }
+.ai { display: inline-block; font-family: var(--mono); font-size: .8rem; border: 1px solid var(--line); border-radius: 999px; padding: .3em .9em; margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <h1 class="logo"><span class="m">M</span>ackDown<span class="arrow">↓</span></h1>
+  <p class="tagline">Markdown, turned on its head.</p>
+  <p class="sub">A Markdown viewer for Windows that opens before you've finished double-clicking.
+  Three megabytes. No browser inside. No account. No sidebar that wants to be your friend.</p>
+  <div class="cta">
+    <a class="btn btn-primary" id="dl" href="https://github.com/bezkom/wackdown/releases/latest">⬇ Download for Windows</a>
+    <a class="btn btn-ghost" href="https://github.com/bezkom/wackdown">Source on GitHub</a>
+  </div>
+  <p class="release" id="release">Latest release: <b>…</b></p>
+
+  <div class="shot">
+    <div class="bar"><i></i><i></i><i></i><span id="shot-title">hero.md — ƜackDown · Cyberpunk Terminal</span></div>
+    <img id="shot" src="img/theme-cyberpunk-terminal.png" width="1000" height="721" alt="ƜackDown showing a Markdown document in the Cyberpunk Terminal theme">
+  </div>
+  <div class="themes" id="themes"></div>
+  <p class="gallery-hint dim">In the app you press <kbd>T</kbd>. Here you have to click, like an animal.</p>
+
+  <div class="label" aria-label="Nutrition facts, parody">
+    <h3>Nutrition Facts</h3>
+    <div class="row thick"><span>Serving size</span><b>1 .md file</b></div>
+    <div class="row"><span>Download size</span><b id="dlsize">~3 MB</b></div>
+    <div class="row"><span>Browser engines</span><b>0</b></div>
+    <div class="row"><span>Background services</span><b>0</b></div>
+    <div class="row"><span>Accounts required</span><b>0</b></div>
+    <div class="row"><span>Telemetry</span><b>0 g</b></div>
+    <div class="row"><span>Fonts, embedded</span><b>3 cuts</b></div>
+    <div class="row thick"><span>Themes</span><b>6</b></div>
+    <div class="fine">Percent daily values are based on a 2,000-tab diet. Contains Rust. Processed on GPUs that also process games.</div>
+  </div>
+</header>
+
+<section>
+  <div class="narrow">
+    <h2><span class="hash">#</span>A short history of opening a text file</h2>
+    <ul class="timeline">
+      <li><span class="year">1995</span> — You double-click <code>readme.txt</code>. Notepad appears. <span class="t">Instant.</span> Nobody is impressed; that's just how computers work.</li>
+      <li><span class="year">2008</span> — Markdown exists now. You open a <code>.md</code> in a text editor and squint at the asterisks. <span class="t">Instant, but ugly.</span></li>
+      <li><span class="year">2016</span> — A beautiful Markdown app appears. It ships its own web browser to draw headings. <span class="t">Four seconds</span>, then a "What's new" tab.</li>
+      <li><span class="year">2022</span> — Same app, now with sync, plugins, an AI assistant and a 400 MB update. You wanted to read a to-do list. <span class="t">Six seconds</span> and a login prompt.</li>
+      <li><span class="year">2026</span> — ƜackDown. One small executable that talks straight to the graphics card. The first screen of a 40,000-block document lays out in about <span class="t">2 milliseconds</span>; the rest finishes while you read. <span class="t">Instant again.</span> Nobody is impressed. That's the point.</li>
+    </ul>
+    <p class="dim">Times for other apps are from memory and mild resentment, not benchmarks. The 2 ms figure is from our own test suite on an ordinary desktop. Your mileage may vary; it will still be short.</p>
+  </div>
+</section>
+
+<section style="background: var(--bg-2); border-block: 1px solid var(--line);">
+  <div class="narrow">
+    <h2><span class="hash">#</span>Things ƜackDown will never do</h2>
+    <p class="dim">A feature list, but for the features we're proudest of not having.</p>
+    <ul class="never">
+      <li>Ask you to create an account</li>
+      <li>Sync to a cloud</li>
+      <li>Show a splash screen</li>
+      <li>Open a "What's new" page</li>
+      <li>Install a background updater</li>
+      <li>Offer a plugin marketplace</li>
+      <li>Run on macOS or Linux</li>
+      <li>Grow an AI sidebar</li>
+      <li>Manage your files for you</li>
+      <li>Render HTML, ever</li>
+      <li>Phone home</li>
+      <li>Take four seconds to open a list</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="hash">#</span>What it does instead</h2>
+    <div class="grid">
+      <div class="card"><h3>Opens huge files instantly</h3><p>It lays out only what fits on your screen before the window appears, and does the rest a few milliseconds at a time while you read. The scrollbar politely estimates the length until it knows.</p></div>
+      <div class="card"><h3>Draws with the GPU, not a browser</h3><p>Direct2D and DirectWrite, straight from Rust. Every frame is timed to your monitor's refresh rate, so scrolling and zooming feel like they belong to the OS, because they do.</p></div>
+      <div class="card"><h3>Six themes, zero CSS</h3><p>Cyberpunk Terminal, Tokyo Dusk, Monokai Pro Rust, Nordic Fjord, Solarized Deep Dark and Paper &amp; Gutenberg. Each pairs its own body, heading and code fonts. Write your own in a few lines of JSON.</p></div>
+      <div class="card"><h3>Brings its own typeface</h3><p>Iosevka, in monospace, sans and serif cuts, embedded in the exe. Your documents look the same on every machine, including the one where somebody uninstalled the fonts.</p></div>
+      <div class="card"><h3>Reloads when you save</h3><p>Keep your real editor open next to it. Hit save, and ƜackDown has already redrawn by the time you look over. No "file changed on disk" dialog, because what else would you want?</p></div>
+      <div class="card"><h3>Code blocks that respect identifiers</h3><p>Long lines scroll sideways instead of wrapping in the middle of <code>Api.Integrators</code>. Syntax colors for a dozen languages. A Copy button appears when you hover, then goes away again.</p></div>
+      <div class="card"><h3>Math, within reason</h3><p>TeX becomes Unicode: <code>$E = mc^2$</code> renders as E = mc², <code>\alpha \leq \beta</code> as α ≤ β. Matrices and other things Unicode can't say are shown as source, honestly, instead of wrong.</p></div>
+      <div class="card"><h3>The extensions people actually use</h3><p>Tables, task lists, footnotes that link both ways, callouts with real icons, definition lists, <code>[[wiki links]]</code>, H~2~O, 2^10^, <code>{#custom-ids}</code>. Mermaid diagrams are shown as code. We're sorry. We're not that sorry.</p></div>
+      <div class="card"><h3>Keyboard first</h3><p>Everything is a key away: zoom, themes, back, select all, copy, a help page on <kbd>F1</kbd>. The mouse is welcome too. It just isn't required.</p></div>
+    </div>
+  </div>
+</section>
+
+<section style="background: var(--bg-2); border-block: 1px solid var(--line);">
+  <div class="narrow">
+    <h2><span class="hash">#</span>Weight class</h2>
+    <p class="dim">Installed size. Lower is better, unless you enjoy progress bars.</p>
+    <div class="bars">
+      <div class="bar-row"><span>Apollo guidance computer, total memory</span><div class="fill"><i style="--w: .2%"></i></div><span class="n">72 KB</span></div>
+      <div class="bar-row"><span>A floppy disk</span><div class="fill"><i style="--w: 1.2%"></i></div><span class="n">1.44 MB</span></div>
+      <div class="bar-row us"><span>ƜackDown, fonts included</span><div class="fill"><i style="--w: 2.5%"></i></div><span class="n">3.2 MB</span></div>
+      <div class="bar-row"><span>Windows 95, the whole operating system</span><div class="fill"><i style="--w: 40%"></i></div><span class="n">~50 MB</span></div>
+      <div class="bar-row"><span>A typical "lightweight" note app</span><div class="fill"><i style="--w: 100%"></i></div><span class="n">~250 MB*</span></div>
+    </div>
+    <p class="dim" style="font-size:.9rem">* Estimate. It's always an estimate; it updated itself while we were measuring. We tried to fit on a floppy. Two floppies. We'll keep trying.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="hash">#</span>Keys</h2>
+    <div class="keys">
+      <div><span>Theme picker with live preview</span><span><kbd>Ctrl</kbd> <kbd>T</kbd></span></div>
+      <div><span>Next / previous theme</span><span><kbd>T</kbd> / <kbd>Shift</kbd> <kbd>T</kbd></span></div>
+      <div><span>Zoom, centered on the cursor</span><span><kbd>Ctrl</kbd> + wheel</span></div>
+      <div><span>Reset zoom</span><span><kbd>Ctrl</kbd> <kbd>0</kbd></span></div>
+      <div><span>Scroll a wide code block sideways</span><span><kbd>Shift</kbd> + wheel</span></div>
+      <div><span>Page down / up</span><span><kbd>Space</kbd> / <kbd>Shift</kbd> <kbd>Space</kbd></span></div>
+      <div><span>Top / bottom</span><span><kbd>Home</kbd> / <kbd>End</kbd></span></div>
+      <div><span>Open a file</span><span><kbd>Ctrl</kbd> <kbd>O</kbd> or drop it on the window</span></div>
+      <div><span>Back, after following a link</span><span><kbd>Backspace</kbd></span></div>
+      <div><span>Select all, copy</span><span><kbd>Ctrl</kbd> <kbd>A</kbd>, <kbd>Ctrl</kbd> <kbd>C</kbd></span></div>
+      <div><span>Reload file and themes</span><span><kbd>F5</kbd></span></div>
+      <div><span>Help, with a tour of every feature</span><span><kbd>F1</kbd></span></div>
+    </div>
+  </div>
+</section>
+
+<section style="background: var(--bg-2); border-block: 1px solid var(--line);">
+  <div class="narrow">
+    <h2><span class="hash">#</span>Questions people might ask</h2>
+    <details><summary>Does it run on macOS?</summary><p>No. ƜackDown talks directly to Windows' graphics stack, which is the entire reason it's small and fast. A port would mean a portability layer, and then we'd be the thing we're making fun of.</p></details>
+    <details><summary>Linux?</summary><p>Also no. See above, but with more goodwill.</p></details>
+    <details><summary>Can I edit files with it?</summary><p>No. You already have an editor you like. Open the file there, keep ƜackDown next to it, and every save shows up instantly. Two small tools beat one big one; this was known in 1995.</p></details>
+    <details><summary>Why is the M upside down?</summary><p>Because it's Markdown, turned on its head. The letter is Ɯ, U+019C, "Latin capital letter turned M". It has been sitting in Unicode since 1993 waiting for a job. We gave it one.</p></details>
+    <details><summary>Windows says it doesn't recognize this app.</summary><p>Correct, and Windows is being honest: the files aren't code-signed yet, because certificates cost either money or reputation and we're starting with neither. Click <em>More info → Run anyway</em>, or verify the SHA-256 checksum published with every release, like the responsible adult you are. Starring the repo helps us qualify for free signing. That's not a joke; it's literally how the program works.</p></details>
+    <details><summary>Where does it keep my settings?</summary><p>One tiny JSON file in <code>%APPDATA%\WackDown</code> that remembers your theme. Drop your own themes in a folder next to it. That's the whole configuration story.</p></details>
+    <details><summary>Does it support images?</summary><p>It shows their alt text, which is more than most people write. Real image rendering is on the list. Mermaid diagrams are shown as code, which is technically rendering.</p></details>
+    <details><summary>Who wrote this?</summary><p>An AI coding assistant (Claude Code), with a human holding the leash, reviewing the work and making the rude design decisions. The code is GPL-3.0, so you can read every line and judge for yourself.</p></details>
+  </div>
+</section>
+
+<section>
+  <div class="narrow">
+    <h2><span class="hash">#</span>Install in three steps, one of which is a warning</h2>
+    <ol class="steps">
+      <li><a id="dl2" href="https://github.com/bezkom/wackdown/releases/latest">Download the installer</a> (or the portable exe, if installers aren't your thing). Windows 10 or 11, 64-bit.</li>
+      <li>Run it. It installs for your user only, so there's no admin prompt, and it offers to open <code>.md</code> files politely, without stealing them from an app you've already chosen.</li>
+      <li>Double-click a Markdown file. Blink. Notice that you didn't need to.</li>
+    </ol>
+    <div class="smart"><b>SmartScreen will frown.</b> The release isn't signed yet (see the questions above). Choose <em>More info → Run anyway</em>, or check the file against <code>SHA256SUMS.txt</code> on the release page first.</div>
+  </div>
+</section>
+
+<footer>
+  <p><b style="color:var(--amber)">ƜackDown</b> · free software under the GPL-3.0-or-later · <a href="https://github.com/bezkom/wackdown">source</a> · <a href="https://github.com/bezkom/wackdown/releases">releases</a> · <a href="https://github.com/bezkom/wackdown#code-signing-policy">code signing policy</a></p>
+  <p>Typeset in Iosevka, the same fonts the app ships with. Iosevka is © Renzhi Li, SIL Open Font License.</p>
+  <p class="ai">AI-generated · Claude Code · human supervised</p>
+</footer>
+
+<script>
+(function () {
+  var themes = [
+    ["cyberpunk-terminal", "Cyberpunk Terminal", ["#090a0f", "#ffb400", "#00f0ff", "#ff0055"]],
+    ["tokyo-dusk", "Tokyo Dusk", ["#131424", "#f7768e", "#bb9af7", "#7aa2f7"]],
+    ["monokai-pro-rust", "Monokai Pro Rust", ["#19181a", "#ff6188", "#fc9867", "#ffd866"]],
+    ["nordic-fjord", "Nordic Fjord", ["#161922", "#88c0d0", "#81a1c1", "#8fbcbb"]],
+    ["solarized-deep-dark", "Solarized Deep Dark", ["#00141a", "#b58900", "#268bd2", "#2aa198"]],
+    ["paper-gutenberg", "Paper & Gutenberg", ["#f7f4ed", "#a62424", "#2c3e50", "#593e2b"]],
+    ["picker", "The picker itself", ["#090a0f", "#ffb400", "#ffb400", "#ffb400"]]
+  ];
+  var box = document.getElementById("themes"), img = document.getElementById("shot"), title = document.getElementById("shot-title");
+  function src(t) { return "img/" + (t[0] === "picker" ? "picker" : "theme-" + t[0]) + ".png"; }
+  themes.forEach(function (t, i) {
+    var b = document.createElement("button");
+    b.type = "button"; b.setAttribute("aria-pressed", i === 0 ? "true" : "false");
+    var sw = document.createElement("i");
+    t[2].forEach(function (c) { var d = document.createElement("b"); d.style.background = c; sw.appendChild(d); });
+    b.appendChild(sw); b.appendChild(document.createTextNode(t[1]));
+    b.addEventListener("click", function () {
+      img.src = src(t);
+      img.alt = "ƜackDown in the " + t[1] + " theme";
+      title.textContent = "hero.md — ƜackDown · " + (t[0] === "picker" ? "Cyberpunk Terminal (Ctrl+T)" : t[1]);
+      box.querySelectorAll("button").forEach(function (o) { o.setAttribute("aria-pressed", o === b ? "true" : "false"); });
+    });
+    box.appendChild(b);
+    var pre = new Image(); pre.src = src(t);
+  });
+
+  // Live release info from GitHub (no key needed; fails quietly if rate-limited).
+  fetch("https://api.github.com/repos/bezkom/wackdown/releases/latest")
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (rel) {
+      if (!rel) return;
+      var setup = (rel.assets || []).filter(function (a) { return /^wackdown-setup-.*\.exe$/.test(a.name); })[0];
+      var el = document.getElementById("release");
+      el.innerHTML = "Latest release: <b>" + rel.tag_name + "</b>" + (setup ? " · " + (setup.size / 1048576).toFixed(1) + " MB installer" : "") +
+        " · " + new Date(rel.published_at).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+      if (setup) {
+        document.getElementById("dl").href = setup.browser_download_url;
+        document.getElementById("dl2").href = setup.browser_download_url;
+        document.getElementById("dlsize").textContent = (setup.size / 1048576).toFixed(1) + " MB";
+      }
+    }).catch(function () {});
+})();
+</script>
+</body>
+</html>

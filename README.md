@@ -12,6 +12,8 @@
 
 **[Download the latest release](https://github.com/bezkom/wackdown/releases/latest)**: the installer or a portable exe (Windows 10/11 x64).
 
+**Website:** [bezkom.github.io/wackdown](https://bezkom.github.io/wackdown/)
+
 ## Highlights
 - **Instant Cold Launch**: Double clicking any `.md` file opens the window almost instantly.
 - **Zero Runtime Dependencies**: No Electron, no WebView2, no Chromium, no Node.js.
