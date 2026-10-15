@@ -64,6 +64,8 @@ pub struct ViewState<'a> {
     pub find: Option<FindView>,
     /// Bottom-left status strip (the URL of a hovered link).
     pub status: Option<String>,
+    /// Message at an end of the zoom range: (zoomed all the way out?, alpha).
+    pub zoom_note: Option<(bool, f32)>,
 }
 
 /// The Ctrl+F bar.
@@ -277,6 +279,9 @@ impl Renderer {
             }
             if let Some(status) = &view.status {
                 draw_status(&target, &mut self.brushes, &self.dwrite, &ui, pal, status, vw, vh)?;
+            }
+            if let Some((far_out, alpha)) = view.zoom_note {
+                draw_zoom_note(&target, &mut self.brushes, &self.dwrite, &ui, pal, far_out, alpha, vw, vh)?;
             }
             self.last_draw_ms = started.elapsed().as_secs_f32() * 1000.0;
             let ended = dc.EndDraw(None, None);
@@ -720,6 +725,48 @@ fn draw_find(
         cl.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
         cl.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
         dc.DrawTextLayout(pt(panel.right - 12.0 - counter_w, panel.top), &cl, &brush(ccolor)?, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+    }
+    Ok(())
+}
+
+/// What you find at the ends of the zoom range. Drawn unscaled, centered near the bottom.
+#[allow(clippy::too_many_arguments)]
+fn draw_zoom_note(
+    dc: &ID2D1RenderTarget,
+    brushes: &mut HashMap<u32, ID2D1SolidColorBrush>,
+    dwrite: &IDWriteFactory,
+    ui: &UiFormats,
+    pal: &Palette,
+    far_out: bool,
+    alpha: f32,
+    vw: f32,
+    vh: f32,
+) -> Result<()> {
+    let (title, body) = if far_out {
+        ("You have reached orbit.", "This is your whole document. The words are still down there; they've just become a texture. Ctrl+0 brings you home.")
+    } else {
+        ("You have reached the letter.", "You are now closer to this glyph than its type designer ever was. It would like a moment alone. Ctrl+0 backs away politely.")
+    };
+    let mut brush = |c: Rgba| get_brush(brushes, dc, c);
+    let w = (vw - 80.0).clamp(200.0, 560.0);
+    unsafe {
+        let mk = |text: &str, format: &IDWriteTextFormat| -> Result<(IDWriteTextLayout, f32)> {
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            let tl = dwrite.CreateTextLayout(&wide, format, w - 40.0, 200.0)?;
+            tl.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            let mut m = DWRITE_TEXT_METRICS::default();
+            let _ = tl.GetMetrics(&mut m);
+            Ok((tl, m.height))
+        };
+        let (t, th) = mk(title, &ui.bold)?;
+        let (b, bh) = mk(body, &ui.small)?;
+        let h = th + bh + 28.0;
+        let panel = D2D_RECT_F { left: (vw - w) / 2.0, top: vh - h - 48.0, right: (vw + w) / 2.0, bottom: vh - 48.0 };
+        dc.FillRoundedRectangle(&rounded(panel, 10.0), &brush(Rgba { a: 0.94 * alpha, ..pal.code_background })?);
+        dc.DrawRoundedRectangle(&rounded(panel, 10.0), &brush(pal.accent.with_alpha(0.7 * alpha))?, 1.0, None);
+        let opts = D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT;
+        dc.DrawTextLayout(pt(panel.left + 20.0, panel.top + 14.0), &t, &brush(pal.accent.with_alpha(alpha))?, opts);
+        dc.DrawTextLayout(pt(panel.left + 20.0, panel.top + 14.0 + th + 4.0), &b, &brush(pal.text.with_alpha(0.85 * alpha))?, opts);
     }
     Ok(())
 }

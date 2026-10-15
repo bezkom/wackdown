@@ -8,7 +8,7 @@ A native Direct2D Markdown viewer. Drop a `.md` file onto this window, press **C
 |:--|:--|
 | Scroll | Mouse wheel, `↑` `↓`, `PgUp` `PgDn`, `Space` / `Shift+Space` |
 | Top / bottom | `Home` / `End` |
-| Zoom | `Ctrl` + wheel, `Ctrl +` / `Ctrl -`, reset with `Ctrl 0` |
+| Zoom, from 4% to 5000% | `Ctrl` + wheel, `Ctrl +` / `Ctrl -`, reset with `Ctrl 0` |
 | Scroll a wide code block sideways | `Shift` + wheel, tilt wheel or two-finger swipe |
 | Copy a code block | Hover it and click **Copy** |
 | Theme picker (live preview) | `Ctrl+T`, then `↑` `↓`, `Enter` keep, `Esc` revert |

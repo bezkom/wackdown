@@ -316,6 +316,7 @@ impl Harness {
                 current_match: (!matches.is_empty()).then_some(i % matches.len().max(1)),
                 find: Some(FindView { query: if i == 0 { String::new() } else { "e".into() }, count: matches.len(), current: 0 }),
                 status: Some(format!("https://example.com/{}", "very-long-path/".repeat(i * 20))),
+                zoom_note: (i > 0).then_some((i == 1, 0.5 * i as f32)),
                 scrollbar: ScrollbarView { width: 4.0 + 4.0 * i as f32, alpha: 1.0, track: (i == 1) as u8 as f32 },
                 zoom: (i == 1).then_some((1.35, vw / 2.0, vh / 3.0)),
                 flash,
@@ -362,7 +363,9 @@ fn spec_corpus_lays_out_and_renders_in_every_theme() {
         let doc = parse_markdown(&md);
         let zoom = match i % 9 {
             0 => 0.5,
+            1 => 0.04,
             4 => 3.0,
+            7 => 50.0,
             _ => 1.0,
         };
         guarded(&label, &md, || {

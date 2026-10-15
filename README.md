@@ -101,7 +101,7 @@ Not supported: Mermaid diagrams render as code blocks.
 |:--|:--|
 | Scroll | Mouse wheel, `↑` `↓`, `PgUp` `PgDn`, `Space` / `Shift+Space`, scrollbar drag |
 | Top / bottom | `Home` / `End` |
-| Zoom (fluid, centered on the cursor) | `Ctrl` + wheel, `Ctrl +` / `Ctrl -`, reset with `Ctrl 0` |
+| Zoom (fluid, centered on the cursor; 4% to 5000%) | `Ctrl` + wheel, `Ctrl +` / `Ctrl -`, reset with `Ctrl 0` |
 | Scroll a wide code block sideways | `Shift` + wheel, tilt wheel or two-finger swipe over the block |
 | Copy a code block | Hover it and click **Copy** |
 | Theme picker (live preview) | `Ctrl+T`, then `↑` `↓` to preview, `Enter` to keep, `Esc` to revert |
@@ -124,11 +124,12 @@ Only `name`, `colors.background` and `colors.text` are required — every other 
 layout value falls back to something derived from those. A custom theme with the same `id` as a
 built-in one replaces it.
 
-`layout.measure` sets the reading width in characters of the body font (prose reads best at roughly
-65–90); `layout.maxWidth` caps it and is how far code blocks may widen when their content needs the
-room. Wide tables may use the whole window width; `typography.tableScale` (default `0.9`) sets table
-text size relative to body text. Table columns are sized like a browser's automatic layout: each
-column keeps its longest word intact, short columns are never wrapped, and long prose cells wrap.
+`layout.measure` sets the reading width in characters of the body font (the built-in themes use
+96–120; lower it for a narrower, more bookish column); `layout.maxWidth` caps it and is how far code
+blocks may widen when their content needs the room. Tables stay within the text column and are
+centered in it; `typography.tableScale` (default `0.9`) sets table text size relative to body text.
+Table columns are sized like a browser's automatic layout: each column keeps its longest word
+intact, short columns are never wrapped, and long prose cells wrap.
 
 Typography has three font roles, each a CSS-style list where the first available family wins:
 `fontFamily` (body text), `headingFontFamily` (defaults to the body font) and `codeFontFamily` (defaults

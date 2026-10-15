@@ -30,8 +30,9 @@ const TIMER_WATCH: usize = 2;
 const WM_MOUSEHWHEEL: u32 = 0x020E;
 /// Icon resource 1 in wackdown.rc (MAKEINTRESOURCE(1)).
 const APP_ICON: PCWSTR = PCWSTR(1 as *const u16);
-const MIN_ZOOM: f32 = 0.5;
-const MAX_ZOOM: f32 = 3.0;
+/// Zoom range: from "the whole document as a texture" to "a single letter as a landscape".
+const MIN_ZOOM: f32 = 0.04;
+const MAX_ZOOM: f32 = 50.0;
 /// Time per frame spent extending an incomplete layout.
 const LAYOUT_BUDGET: Duration = Duration::from_millis(6);
 /// Scrolling spring stiffness (rad/s).
@@ -91,6 +92,8 @@ struct App {
     zoom: Zoom,
     /// Block anchor to restore after a zoom relayout: (block, frac, view y).
     zoom_anchor: Option<((usize, f32), f32)>,
+    /// Fades in the message that greets anyone who reaches either end of the zoom range.
+    zoom_note: Fade,
     /// (anchor, focus), unordered.
     selection: Option<(TextPos, TextPos)>,
     selecting: bool,
@@ -205,6 +208,7 @@ pub fn run_window_loop(file: Option<PathBuf>, startup_timer: Instant) -> Result<
             scroll: Spring::new(0.0, SCROLL_OMEGA),
             zoom: Zoom { committed: saved_zoom, visual: saved_zoom, target: saved_zoom, anchor_y: 0.0, last_input: now },
             zoom_anchor: None,
+            zoom_note: Fade::default(),
             selection: None,
             selecting: false,
             press_link: None,
@@ -666,6 +670,15 @@ impl App {
             if let Some((anchor, view_y)) = self.zoom_anchor.take() {
                 let y = self.renderer.layout().map_or(0.0, |l| l.block_y(anchor)) - view_y;
                 self.scroll.set(y);
+                // Extreme zoom can land the view on empty space (padding, the gap between giant
+                // lines): make sure some text is on screen.
+                let max = self.max_scroll();
+                let s = self.scroll.value.clamp(0.0, max);
+                if let Some(top) = self.renderer.layout().and_then(|l| l.nearest_text_top(s)) {
+                    if top > s + vh * 0.8 || top + self.line_height() < s {
+                        self.scroll.set((top - vh * 0.1).clamp(0.0, max));
+                    }
+                }
             } else if let Some(anchor) = prior_anchor {
                 let y = self.renderer.layout().map_or(0.0, |l| l.block_y(anchor));
                 let delta = self.scroll.target - self.scroll.value;
@@ -738,6 +751,11 @@ impl App {
         self.code_fade.on = self.code_hover.is_some();
         self.code_fade.step(dt, 14.0);
 
+        // The note appears only once the zoom has settled at an end of the range.
+        let z = &self.zoom;
+        self.zoom_note.on = z.visual == z.target && z.committed == z.target && (z.target <= MIN_ZOOM || z.target >= MAX_ZOOM);
+        self.zoom_note.step(dt, 5.0);
+
         if self.flash.as_ref().is_some_and(|(_, t)| t.elapsed() > FLASH) {
             self.flash = None;
         }
@@ -757,6 +775,7 @@ impl App {
             || self.scrollbar_visible.moving()
             || self.scrollbar_visible.on
             || self.code_fade.moving()
+            || self.zoom_note.moving()
             || self.flash.is_some()
             || self.copied.is_some()
             || self.renderer.animating()
@@ -817,6 +836,7 @@ impl App {
             current_match: self.find.as_ref().filter(|f| !f.matches.is_empty()).map(|f| f.current),
             find: self.find.as_ref().map(|f| FindView { query: f.query.clone(), count: f.matches.len(), current: f.current }),
             status,
+            zoom_note: (self.zoom_note.value > 0.0).then_some((self.zoom.committed <= MIN_ZOOM, self.zoom_note.value)),
         };
         match self.renderer.render(&self.palette, &view) {
             Ok(true) => {
@@ -858,8 +878,16 @@ impl App {
     }
 
     /// Starts or retargets a zoom gesture centered on view y `anchor_y`.
+    /// One zoom step in or out. Steps grow at the extremes so reaching orbit doesn't take all day.
+    fn zoom_step(&mut self, notches: f32, anchor_y: f32) {
+        let z = self.zoom.target;
+        let factor: f32 = if !(0.5..=2.0).contains(&z) { 1.25 } else { 1.1 };
+        self.zoom_to(z * factor.powf(notches), anchor_y);
+    }
+
     fn zoom_to(&mut self, zoom: f32, anchor_y: f32) {
-        let z = (zoom * 100.0).round().clamp(MIN_ZOOM * 100.0, MAX_ZOOM * 100.0) / 100.0;
+        // Three decimals: fine enough for the small end, and keeps 1.0 exactly reachable.
+        let z = (zoom.clamp(MIN_ZOOM, MAX_ZOOM) * 1000.0).round() / 1000.0;
         if self.zoom.visual == self.zoom.committed {
             // New gesture: pin it to where it started.
             self.zoom.anchor_y = anchor_y;
@@ -1166,7 +1194,7 @@ impl App {
     /// Wheel input. `horizontal` for tilt wheels / two-finger sideways swipes.
     fn on_wheel(&mut self, delta: f32, horizontal: bool, ctrl: bool, shift: bool, x: f32, y: f32) {
         if ctrl && !horizontal {
-            self.zoom_to(self.zoom.target * 1.1f32.powf(delta), y);
+            self.zoom_step(delta, y);
             return;
         }
         // Sideways scrolling (or Shift+wheel) over a code block scrolls that block.
@@ -1249,8 +1277,8 @@ impl App {
                 self.selection = None;
                 self.invalidate();
             }
-            VK_OEM_PLUS | VK_ADD if ctrl => self.zoom_to(self.zoom.target * 1.1, vh / 2.0),
-            VK_OEM_MINUS | VK_SUBTRACT if ctrl => self.zoom_to(self.zoom.target / 1.1, vh / 2.0),
+            VK_OEM_PLUS | VK_ADD if ctrl => self.zoom_step(1.0, vh / 2.0),
+            VK_OEM_MINUS | VK_SUBTRACT if ctrl => self.zoom_step(-1.0, vh / 2.0),
             VK_0 | VK_NUMPAD0 if ctrl => self.zoom_to(1.0, vh / 2.0),
             VK_C if ctrl => self.copy_selection(),
             VK_A if ctrl => {

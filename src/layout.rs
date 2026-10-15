@@ -284,6 +284,12 @@ impl Layout {
         self.items.partition_point(|it| it.y + it.h < y)
     }
 
+    /// Top of the nearest text at or below document y, or of the last text if y is past it.
+    pub fn nearest_text_top(&self, y: f32) -> Option<f32> {
+        let i = self.item_at_y(y).min(self.items.len().checked_sub(1)?);
+        Some(self.items[i].y)
+    }
+
     /// Whether a document point is over any text (for the I-beam cursor).
     pub fn over_text(&self, x: f32, y: f32) -> bool {
         let first = self.items.partition_point(|it| it.y + it.h < y);
@@ -410,9 +416,6 @@ pub(crate) struct LayoutBuilder {
     /// Breakout column for top-level code blocks and tables.
     wide_left: f32,
     wide_right: f32,
-    /// Wide tables may use the whole window width (minus padding), beyond `maxWidth`.
-    full_left: f32,
-    full_right: f32,
     table_body: IDWriteTextFormat,
     table_bold: IDWriteTextFormat,
     indent_step: f32,
@@ -514,8 +517,6 @@ impl LayoutBuilder {
             right: center + prose_w / 2.0,
             wide_left: center - wide_w / 2.0,
             wide_right: center + wide_w / 2.0,
-            full_left: pad_x,
-            full_right: pad_x + outer_w,
             table_body,
             table_bold,
             indent_step: fs * 1.8,
@@ -528,8 +529,9 @@ impl LayoutBuilder {
             headings,
             math,
             body_baseline,
-            padding_y: l.padding_y.max(0.0) * z,
-            y: l.padding_y.max(0.0) * z,
+            // Page padding scales with zoom only up to 2x: at 50x nobody wants 1,800 px of margin.
+            padding_y: l.padding_y.max(0.0) * z.min(2.0),
+            y: l.padding_y.max(0.0) * z.min(2.0),
             next: 0,
             laid_weight: 0.0,
             total_weight: doc.blocks.iter().map(weight).sum(),
@@ -717,7 +719,7 @@ impl LayoutBuilder {
                 let tx = x + icon + self.fs * 0.5;
                 self.inline(layout, brushes, &text, &self.body_bold.clone(), color, tx, (w - (tx - x)).max(self.fs), sep, DWRITE_TEXT_ALIGNMENT_LEADING)?
             }
-            BlockKind::Table { aligns, rows } => self.table(layout, brushes, aligns, rows, x, w, breakout, sep)?,
+            BlockKind::Table { aligns, rows } => self.table(layout, brushes, aligns, rows, x, w, sep)?,
         };
         self.y = top + h;
         layout.spans.push(Span { gtop, top, bottom: self.y });
@@ -1027,7 +1029,6 @@ impl LayoutBuilder {
         rows: &[Vec<InlineText>],
         x: f32,
         w: f32,
-        breakout: bool,
         sep: Sep,
     ) -> Result<f32> {
         let ncols = rows.iter().map(Vec::len).max().unwrap_or(0).max(aligns.len());
@@ -1038,13 +1039,11 @@ impl LayoutBuilder {
         let px = ts * 0.65;
         let py = ts * 0.4;
         let top = self.y;
-        let full = (self.full_left, self.full_right);
 
         // Per column: natural width (no wrapping) and min-content width (longest unbreakable
-        // word, so identifiers like `Api.Integrators` never split), measured against the widest
-        // area this table could get.
+        // word, so identifiers like `Api.Integrators` never split).
         let empty = InlineText::default();
-        let measure_w = if breakout { (full.1 - full.0).max(w) } else { w };
+        let measure_w = w;
         let mut natural = vec![ts; ncols];
         let mut min_content = vec![ts; ncols];
         for (ri, row) in rows.iter().enumerate() {
@@ -1057,13 +1056,11 @@ impl LayoutBuilder {
                 min_content[c] = min_content[c].max(min.ceil() + 1.0);
             }
         }
-        // Tables that fit stay left-aligned with the prose; wider ones widen around the center,
-        // up to the full window width.
-        let needed = natural.iter().sum::<f32>() + ncols as f32 * 2.0 * px;
-        let (x, w) = self.widen(x, w, needed, breakout, full);
+        // A table never exceeds the text column; narrower ones are centered in it.
         let avail = (w - ncols as f32 * 2.0 * px).max(ts * ncols as f32);
         let widths = column_widths(&natural, &min_content, avail);
         let table_w: f32 = widths.iter().map(|cw| cw + 2.0 * px).sum();
+        let x = x + ((w - table_w) / 2.0).max(0.0);
         let col_x: Vec<f32> = widths
             .iter()
             .scan(x, |acc, cw| {
