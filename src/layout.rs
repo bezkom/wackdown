@@ -168,6 +168,9 @@ impl Layout {
 
     pub fn block_y(&self, (i, frac): (usize, f32)) -> f32 {
         match self.spans.get(i) {
+            // At (or above) the first block means the top of the document, not the top of
+            // its padding: a resize while scrolled to the top must stay at the top.
+            Some(_) if i == 0 && frac <= 0.0 => 0.0,
             Some(s) => s.gtop + (s.bottom - s.gtop) * frac,
             None => self.height,
         }
@@ -243,6 +246,40 @@ impl Layout {
             .into_iter()
             .map(|m| D2D_RECT_F { left: x + m.left, top: it.y + m.top, right: x + m.left + m.width, bottom: it.y + m.top + m.height })
             .collect()
+    }
+
+    pub fn link_url(&self, (item, link): (usize, usize)) -> Option<&str> {
+        self.items.get(item)?.links.get(link).map(|l| l.url.as_str())
+    }
+
+    /// Every case-insensitive occurrence of `query`, in document order (Ctrl+F).
+    pub fn find_all(&self, query: &str) -> Vec<(TextPos, TextPos)> {
+        let needle: Vec<u16> = query.encode_utf16().map(fold_unit).collect();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (i, it) in self.items.iter().enumerate() {
+            for (start, len) in find_units(&it.text, &needle) {
+                out.push((TextPos { item: i, pos: start }, TextPos { item: i, pos: start + len }));
+            }
+        }
+        out
+    }
+
+    /// Document-space rectangles of a range within one item (search matches).
+    pub fn match_rects(&self, (s, e): (TextPos, TextPos)) -> Vec<D2D_RECT_F> {
+        let Some(it) = self.items.get(s.item) else { return Vec::new() };
+        let x = self.item_x(s.item);
+        range_rects(&it.layout, s.pos, e.pos.saturating_sub(s.pos))
+            .into_iter()
+            .map(|m| D2D_RECT_F { left: x + m.left, top: it.y + m.top, right: x + m.left + m.width, bottom: it.y + m.top + m.height })
+            .collect()
+    }
+
+    /// Index of the first text item at or below document y.
+    pub fn item_at_y(&self, y: f32) -> usize {
+        self.items.partition_point(|it| it.y + it.h < y)
     }
 
     /// Whether a document point is over any text (for the I-beam cursor).
@@ -1086,6 +1123,38 @@ impl LayoutBuilder {
     }
 }
 
+/// Case-folds one UTF-16 unit for searching. Only the Basic Multilingual Plane folds; surrogate
+/// halves pass through, so emoji still match exactly.
+pub(crate) fn fold_unit(u: u16) -> u16 {
+    match char::from_u32(u as u32) {
+        Some(c) => {
+            let l = c.to_lowercase().next().unwrap_or(c) as u32;
+            if l < 0x1_0000 { l as u16 } else { u }
+        }
+        None => u,
+    }
+}
+
+/// Non-overlapping occurrences of an already-folded `needle` in `hay`, as (start, len).
+pub(crate) fn find_units(hay: &[u16], needle: &[u16]) -> Vec<(u32, u32)> {
+    let n = needle.len();
+    if n == 0 || hay.len() < n {
+        return Vec::new();
+    }
+    let folded: Vec<u16> = hay.iter().map(|&u| fold_unit(u)).collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + n <= folded.len() {
+        if folded[i..i + n] == *needle {
+            out.push((i as u32, n as u32));
+            i += n;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Table column widths, like a browser's automatic table layout: natural widths when they fit;
 /// otherwise every column first gets its min-content width (its longest unbreakable word), and
 /// the remaining space is shared max-min fairly: columns that want little more get all of it,
@@ -1117,7 +1186,20 @@ fn column_widths(natural: &[f32], min_content: &[f32], avail: f32) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::column_widths;
+    use super::{column_widths, find_units, fold_unit};
+
+    #[test]
+    fn search_is_case_insensitive_and_non_overlapping() {
+        let hay: Vec<u16> = "Ɯack ƜACK wack 🦀🦀 aaa".encode_utf16().collect();
+        let needle: Vec<u16> = "ɯack".encode_utf16().map(fold_unit).collect();
+        let hits = find_units(&hay, &needle);
+        assert_eq!(hits.len(), 2, "Ɯ folds to ɯ, plain w does not: {hits:?}");
+        let crab: Vec<u16> = "🦀".encode_utf16().map(fold_unit).collect();
+        assert_eq!(find_units(&hay, &crab).len(), 2, "surrogate pairs match exactly");
+        let aa: Vec<u16> = "aa".encode_utf16().collect();
+        assert_eq!(find_units(&hay, &aa), vec![(20, 2)], "overlapping hits are not double counted");
+        assert!(find_units(&hay, &[]).is_empty());
+    }
 
     #[test]
     fn natural_widths_when_they_fit() {

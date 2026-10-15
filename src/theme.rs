@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
@@ -343,7 +343,7 @@ impl ThemeSet {
             }
         }
 
-        let wanted = load_config_theme_id().unwrap_or_else(|| DEFAULT_THEME_ID.to_string());
+        let wanted = Config::load().theme.unwrap_or_else(|| DEFAULT_THEME_ID.to_string());
         let current = themes.iter().position(|t| t.id == wanted).unwrap_or(0);
         Self { themes, current }
     }
@@ -360,7 +360,8 @@ impl ThemeSet {
 
     /// Remembers the current theme in `%APPDATA%\WackDown\config.json`.
     pub fn save(&self) {
-        save_config_theme_id(&self.current().id);
+        let id = self.current().id.clone();
+        Config::update(|c| c.theme = Some(id));
     }
 }
 
@@ -369,28 +370,69 @@ pub fn config_dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("WackDown"))
 }
 
-fn load_config_theme_id() -> Option<String> {
-    let text = fs::read_to_string(config_dir()?.join("config.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    value.get("theme")?.as_str().map(str::to_string)
+/// Everything ƜackDown remembers between runs: `%APPDATA%\WackDown\config.json`.
+/// Unknown keys are kept as-is so hand edits and newer versions survive a round trip.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zoom: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<WindowPlacement>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
-fn save_config_theme_id(id: &str) {
-    let Some(dir) = config_dir() else { return };
-    let path = dir.join("config.json");
-    let mut value: serde_json::Value = fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-    value["theme"] = serde_json::Value::String(id.to_string());
-    let _ = fs::create_dir_all(&dir);
-    let _ = fs::write(path, serde_json::to_string_pretty(&value).unwrap_or_default());
+/// Last window position (physical pixels, restored-state rectangle) and whether it was maximized.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowPlacement {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub maximized: bool,
+}
+
+impl Config {
+    fn path() -> Option<PathBuf> {
+        config_dir().map(|d| d.join("config.json"))
+    }
+
+    pub fn load() -> Self {
+        Self::path()
+            .and_then(|p| fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok())
+            .unwrap_or_default()
+    }
+
+    /// Read-modify-write, so independent settings never clobber each other.
+    pub fn update(f: impl FnOnce(&mut Config)) {
+        let mut config = Self::load();
+        f(&mut config);
+        let (Some(dir), Some(path)) = (config_dir(), Self::path()) else { return };
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(path, serde_json::to_string_pretty(&config).unwrap_or_default());
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_round_trips_and_keeps_unknown_keys() {
+        let json = r#"{ "theme": "tokyo-dusk", "zoom": 1.25, "window": { "x": 10, "y": 20, "width": 800, "height": 600, "maximized": false }, "futureSetting": [1, 2] }"#;
+        let c: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(c.theme.as_deref(), Some("tokyo-dusk"));
+        assert_eq!(c.zoom, Some(1.25));
+        assert_eq!(c.window.map(|w| w.width), Some(800));
+        let back = serde_json::to_string(&c).unwrap();
+        assert!(back.contains("futureSetting"), "unknown keys survive: {back}");
+        let empty: Config = serde_json::from_str("{}").unwrap();
+        assert!(empty.theme.is_none() && empty.window.is_none());
+    }
 
     #[test]
     fn parses_hex_forms() {

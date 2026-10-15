@@ -26,7 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WI
 
 use crate::highlight::highlight;
 use crate::parser::{parse_file_to_document, parse_markdown, BlockKind, Document, InlineText};
-use crate::renderer::{CodeChrome, Renderer, ScrollbarView, SwitcherEntry, SwitcherView, ViewState};
+use crate::renderer::{CodeChrome, FindView, Renderer, ScrollbarView, SwitcherEntry, SwitcherView, ViewState};
 use crate::theme::{WackDownTheme, EMBEDDED_THEMES};
 
 // ---------------------------------------------------------------------------------------------
@@ -236,6 +236,25 @@ impl Harness {
         self.renderer.finish_layout(doc).unwrap_or_else(|e| panic!("{ctx}: layout failed: {e}"));
         assert!(self.renderer.layout_complete(), "{ctx}: layout incomplete after finish");
 
+        // A relayout while scrolled to the top must land at the top, not at the first block's padding.
+        {
+            let layout = self.renderer.layout().expect("layout");
+            assert_eq!(layout.block_y(layout.block_at(0.0)), 0.0, "{ctx}: top anchor drifted");
+        }
+
+        // Ctrl+F: every match must be a forward range inside one item.
+        {
+            let layout = self.renderer.layout().expect("layout");
+            let long = "a".repeat(5_000);
+            for q in ["e", "E", "the ", "zzzzqqqq", "🦀", "Ɯ", long.as_str()] {
+                for (s, e) in layout.find_all(q) {
+                    assert!(s.item == e.item && s.pos < e.pos, "{ctx}: bad match range for {q:?}");
+                    assert!(e.pos as usize <= layout.items[s.item].text.len(), "{ctx}: match past the text for {q:?}");
+                    let _ = layout.match_rects((s, e));
+                }
+            }
+        }
+
         let (max_scroll, selection, link, code) = {
             let layout = self.renderer.layout_mut().expect("layout");
             let codes = layout.codes.len();
@@ -286,12 +305,17 @@ impl Harness {
         });
         let rows = [(0usize, 1.0f32), (1, 0.4), (usize::MAX, 1.0)];
         let links: Vec<((usize, usize), f32)> = link.into_iter().map(|l| (l, 0.7)).collect();
+        let matches = self.renderer.layout().map(|l| l.find_all("e")).unwrap_or_default();
         for (i, scroll) in [0.0, (max_scroll / 2.0).round(), max_scroll].into_iter().enumerate() {
             let view = ViewState {
                 scroll,
                 selection,
                 rows: &rows,
                 links: &links,
+                matches: &matches,
+                current_match: (!matches.is_empty()).then_some(i % matches.len().max(1)),
+                find: Some(FindView { query: if i == 0 { String::new() } else { "e".into() }, count: matches.len(), current: 0 }),
+                status: Some(format!("https://example.com/{}", "very-long-path/".repeat(i * 20))),
                 scrollbar: ScrollbarView { width: 4.0 + 4.0 * i as f32, alpha: 1.0, track: (i == 1) as u8 as f32 },
                 zoom: (i == 1).then_some((1.35, vw / 2.0, vh / 3.0)),
                 flash,

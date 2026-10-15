@@ -17,7 +17,9 @@ A native Direct2D Markdown viewer. Drop a `.md` file onto this window, press **C
 | Select text | Drag, `Shift`+click, double-click a word, `Ctrl+A` |
 | Copy selection | `Ctrl+C` |
 | Follow link | Click; links to other `.md` files open here |
-| Back | `Backspace`, `Alt+←`, mouse back button |
+| Find in page | `Ctrl+F`, then type; `Enter` / `Shift+Enter` or `F3` / `Shift+F3` step through matches, `Esc` closes |
+| Back / forward | `Backspace` or `Alt+←` / `Alt+→`, mouse back and forward buttons |
+| Context menu | Right-click: copy, select all, find, open, themes, help; on a link: open or copy its address |
 | Open file | `Ctrl+O` or drag and drop |
 | Help | `F1` |
 | Close | `Ctrl+W` |
@@ -84,6 +86,6 @@ fn main() {
 
 ## About
 
-ƜackDown is AI-generated (built with Claude Code under human direction) and is free software under the GNU GPL v3 or later. It comes with absolutely no warranty. The Iosevka fonts are embedded under the SIL Open Font License 1.1.
+ƜackDown {version} is AI-generated (built with Claude Code under human direction) and is free software under the GNU GPL v3 or later. It comes with absolutely no warranty. The Iosevka fonts are embedded under the SIL Open Font License 1.1.
 
 [^1]: Footnote definitions appear where they are written.

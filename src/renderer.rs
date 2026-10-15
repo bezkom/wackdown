@@ -58,6 +58,20 @@ pub struct ViewState<'a> {
     pub flash: Option<(D2D_RECT_F, f32)>,
     pub code: Option<CodeChrome>,
     pub switcher: Option<SwitcherView<'a>>,
+    /// Ctrl+F matches in document order, and which one is current.
+    pub matches: &'a [(TextPos, TextPos)],
+    pub current_match: Option<usize>,
+    pub find: Option<FindView>,
+    /// Bottom-left status strip (the URL of a hovered link).
+    pub status: Option<String>,
+}
+
+/// The Ctrl+F bar.
+pub struct FindView {
+    pub query: String,
+    pub count: usize,
+    /// 0-based index of the current match.
+    pub current: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -258,6 +272,12 @@ impl Renderer {
             if let Some(switcher) = &view.switcher {
                 draw_switcher(&target, &mut self.brushes, &self.dwrite, &ui, pal, switcher, vw)?;
             }
+            if let Some(find) = &view.find {
+                draw_find(&target, &mut self.brushes, &self.dwrite, &ui, pal, find, vw)?;
+            }
+            if let Some(status) = &view.status {
+                draw_status(&target, &mut self.brushes, &self.dwrite, &ui, pal, status, vw, vh)?;
+            }
             self.last_draw_ms = started.elapsed().as_secs_f32() * 1000.0;
             let ended = dc.EndDraw(None, None);
             if matches!(&ended, Err(e) if e.code() == D2DERR_RECREATE_TARGET) {
@@ -447,6 +467,24 @@ fn draw_scene(
             }
         }
 
+        // Search matches, drawn under the text like the selection.
+        if let (Some(&last_item), false) = (visible.last(), view.matches.is_empty()) {
+            let lo = view.matches.partition_point(|m| m.0.item < first);
+            let normal = brush(pal.accent.with_alpha(0.22))?;
+            let current = brush(pal.accent.with_alpha(0.6))?;
+            for (k, m) in view.matches[lo..].iter().enumerate().take_while(|(_, m)| m.0.item <= last_item) {
+                let item = &layout.items[m.0.item];
+                let b = if view.current_match == Some(lo + k) { &current } else { &normal };
+                with_clip(m.0.item, &mut |x| {
+                    for r in range_rects(&item.layout, m.0.pos, m.1.pos.saturating_sub(m.0.pos)) {
+                        let rr = rect(x + r.left - 1.5, item.y + r.top + dy, r.width + 3.0, r.height);
+                        dc.FillRoundedRectangle(&rounded(rr, 3.0), b);
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+
         for &idx in &visible {
             let item = &layout.items[idx];
             let b = brush(item.color)?;
@@ -626,6 +664,96 @@ fn draw_scrollbar(
         let color = if sb.track > 0.5 { pal.scrollbar_thumb_hover } else { pal.scrollbar_thumb };
         let radius = (thumb.right - thumb.left) / 2.0;
         dc.FillRoundedRectangle(&rounded(thumb, radius), &get_brush(brushes, dc, color.with_alpha(sb.alpha))?);
+    }
+    Ok(())
+}
+
+const FIND_WIDTH: f32 = 340.0;
+const FIND_HEIGHT: f32 = 46.0;
+
+/// The Ctrl+F bar: query with a caret, and a match counter.
+fn draw_find(
+    dc: &ID2D1RenderTarget,
+    brushes: &mut HashMap<u32, ID2D1SolidColorBrush>,
+    dwrite: &IDWriteFactory,
+    ui: &UiFormats,
+    pal: &Palette,
+    find: &FindView,
+    vw: f32,
+) -> Result<()> {
+    let mut brush = |c: Rgba| get_brush(brushes, dc, c);
+    let right = (vw - SCROLLBAR_HIT_WIDTH - 12.0).max(FIND_WIDTH + 12.0);
+    let panel = D2D_RECT_F { left: right - FIND_WIDTH, top: 12.0, right, bottom: 12.0 + FIND_HEIGHT };
+    let dark = pal.background.luminance() < 0.5;
+    unsafe {
+        let shadow = D2D_RECT_F { left: panel.left - 2.0, top: panel.top + 2.0, right: panel.right + 2.0, bottom: panel.bottom + 6.0 };
+        dc.FillRoundedRectangle(&rounded(shadow, 10.0), &brush(Rgba { r: 0.0, g: 0.0, b: 0.0, a: if dark { 0.45 } else { 0.18 } })?);
+        dc.FillRoundedRectangle(&rounded(panel, 8.0), &brush(Rgba { a: 1.0, ..pal.code_background })?);
+        dc.DrawRoundedRectangle(&rounded(panel, 8.0), &brush(pal.accent.with_alpha(0.6))?, 1.0, None);
+
+        let counter_w = 96.0;
+        let text_x = panel.left + 14.0;
+        let text_w = FIND_WIDTH - 14.0 - counter_w - 10.0;
+        let (text, color) = if find.query.is_empty() { ("Find in page".to_string(), pal.text_dim) } else { (find.query.clone(), pal.text) };
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let tl = dwrite.CreateTextLayout(&wide, &ui.normal, text_w, FIND_HEIGHT)?;
+        tl.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+        tl.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+        // Keep the end of a long query visible.
+        let mut m = DWRITE_TEXT_METRICS::default();
+        let _ = tl.GetMetrics(&mut m);
+        let overflow = (m.widthIncludingTrailingWhitespace - text_w).max(0.0);
+        let clip = D2D_RECT_F { left: text_x, top: panel.top, right: text_x + text_w, bottom: panel.bottom };
+        dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
+        dc.DrawTextLayout(pt(text_x - overflow, panel.top), &tl, &brush(color)?, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+        dc.PopAxisAlignedClip();
+        let caret_x = if find.query.is_empty() { text_x } else { text_x - overflow + m.widthIncludingTrailingWhitespace + 1.0 };
+        dc.DrawLine(pt(caret_x, panel.top + 13.0), pt(caret_x, panel.bottom - 13.0), &brush(pal.accent)?, 1.5, None);
+
+        let (counter, ccolor) = match (find.query.is_empty(), find.count) {
+            (true, _) => (String::new(), pal.text_dim),
+            (false, 0) => ("No matches".to_string(), pal.callout_warning),
+            (false, n) => (format!("{} / {n}", find.current + 1), pal.text_dim),
+        };
+        let wide: Vec<u16> = counter.encode_utf16().collect();
+        let cl = dwrite.CreateTextLayout(&wide, &ui.small, counter_w, FIND_HEIGHT)?;
+        cl.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+        cl.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+        dc.DrawTextLayout(pt(panel.right - 12.0 - counter_w, panel.top), &cl, &brush(ccolor)?, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+    }
+    Ok(())
+}
+
+/// Bottom-left strip showing a hovered link's destination, like a browser.
+#[allow(clippy::too_many_arguments)]
+fn draw_status(
+    dc: &ID2D1RenderTarget,
+    brushes: &mut HashMap<u32, ID2D1SolidColorBrush>,
+    dwrite: &IDWriteFactory,
+    ui: &UiFormats,
+    pal: &Palette,
+    text: &str,
+    vw: f32,
+    vh: f32,
+) -> Result<()> {
+    let mut brush = |c: Rgba| get_brush(brushes, dc, c);
+    let max_w = (vw * 0.7).max(120.0);
+    let shown: String = if text.chars().count() > 160 { text.chars().take(159).chain(Some('…')).collect() } else { text.to_string() };
+    let wide: Vec<u16> = shown.encode_utf16().collect();
+    unsafe {
+        let tl = dwrite.CreateTextLayout(&wide, &ui.small, max_w, 22.0)?;
+        tl.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+        tl.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+        let mut m = DWRITE_TEXT_METRICS::default();
+        let _ = tl.GetMetrics(&mut m);
+        let w = m.widthIncludingTrailingWhitespace.min(max_w) + 20.0;
+        let r = D2D_RECT_F { left: -8.0, top: vh - 24.0, right: w, bottom: vh + 8.0 };
+        dc.FillRoundedRectangle(&rounded(r, 6.0), &brush(Rgba { a: 0.96, ..pal.code_background })?);
+        dc.DrawRoundedRectangle(&rounded(r, 6.0), &brush(pal.code_border)?, 1.0, None);
+        let clip = D2D_RECT_F { left: 10.0, top: vh - 24.0, right: w - 10.0, bottom: vh };
+        dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
+        dc.DrawTextLayout(pt(10.0, vh - 23.0), &tl, &brush(pal.text_dim)?, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+        dc.PopAxisAlignedClip();
     }
     Ok(())
 }

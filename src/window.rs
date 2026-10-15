@@ -21,9 +21,9 @@ use crate::fonts::wide;
 use crate::layout::{TextPos, SCROLLBAR_HIT_WIDTH};
 use crate::parser::{parse_file_to_document, parse_markdown, Document, WIKI_PREFIX};
 use crate::renderer::{
-    scrollbar_geometry, switcher_rect, switcher_row_at, CodeChrome, Renderer, ScrollbarView, SwitcherEntry, SwitcherView, ViewState,
+    scrollbar_geometry, switcher_rect, switcher_row_at, CodeChrome, FindView, Renderer, ScrollbarView, SwitcherEntry, SwitcherView, ViewState,
 };
-use crate::theme::{Palette, ThemeSet};
+use crate::theme::{Config, Palette, ThemeSet, WindowPlacement};
 
 const HELP_MD: &str = include_str!("help.md");
 const TIMER_WATCH: usize = 2;
@@ -84,6 +84,8 @@ struct App {
     theme_gen: u64,
     mtime: Option<SystemTime>,
     history: Vec<(Source, f32)>,
+    /// Pages left with Back, for Forward.
+    forward: Vec<(Source, f32)>,
     pending_fragment: Option<String>,
     scroll: Spring,
     zoom: Zoom,
@@ -119,6 +121,19 @@ struct App {
     /// Set by a theme switch: time the next relayout + draw and show it in the picker.
     measure_next: bool,
     switch_stats: Option<String>,
+    /// Ctrl+F bar, while open.
+    find: Option<Find>,
+    /// Last query, so F3 and a reopened bar pick up where you left off.
+    last_query: String,
+}
+
+struct Find {
+    query: String,
+    matches: Vec<(TextPos, TextPos)>,
+    current: usize,
+    /// Document and theme generations the matches were computed for.
+    doc_gen: u64,
+    theme_gen: u64,
 }
 
 fn switcher_entries(themes: &ThemeSet) -> Vec<SwitcherEntry> {
@@ -154,21 +169,15 @@ pub fn run_window_loop(file: Option<PathBuf>, startup_timer: Instant) -> Result<
             return Err(Error::from_win32());
         }
 
+        let config = Config::load();
+        let placement = config.window.filter(|p| placement_is_visible(*p));
         let scale = GetDpiForSystem() as f32 / 96.0;
-        let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            class_name,
-            w!("WackDown"),
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            (1100.0 * scale) as i32,
-            (850.0 * scale) as i32,
-            None,
-            None,
-            instance,
-            None,
-        )?;
+        let (x, y, w, h) = match placement {
+            Some(p) => (p.x, p.y, p.width, p.height),
+            None => (CW_USEDEFAULT, CW_USEDEFAULT, (1100.0 * scale) as i32, (850.0 * scale) as i32),
+        };
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE::default(), class_name, w!("WackDown"), WS_OVERLAPPEDWINDOW, x, y, w, h, None, None, instance, None)?;
+        let saved_zoom = config.zoom.map(|z| z.clamp(MIN_ZOOM, MAX_ZOOM)).unwrap_or(1.0);
 
         let dpi = GetDpiForWindow(hwnd).max(96);
         let themes = ThemeSet::load();
@@ -191,9 +200,10 @@ pub fn run_window_loop(file: Option<PathBuf>, startup_timer: Instant) -> Result<
             theme_gen: 1,
             mtime: None,
             history: Vec::new(),
+            forward: Vec::new(),
             pending_fragment: None,
             scroll: Spring::new(0.0, SCROLL_OMEGA),
-            zoom: Zoom { committed: 1.0, visual: 1.0, target: 1.0, anchor_y: 0.0, last_input: now },
+            zoom: Zoom { committed: saved_zoom, visual: saved_zoom, target: saved_zoom, anchor_y: 0.0, last_input: now },
             zoom_anchor: None,
             selection: None,
             selecting: false,
@@ -222,6 +232,8 @@ pub fn run_window_loop(file: Option<PathBuf>, startup_timer: Instant) -> Result<
             switcher_entries: Vec::new(),
             measure_next: false,
             switch_stats: None,
+            find: None,
+            last_query: String::new(),
         });
         app.switcher_entries = switcher_entries(&app.themes);
         app.load(source, false);
@@ -230,7 +242,7 @@ pub fn run_window_loop(file: Option<PathBuf>, startup_timer: Instant) -> Result<
 
         DragAcceptFiles(hwnd, true);
         SetTimer(hwnd, TIMER_WATCH, 700, None);
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(hwnd, if placement.is_some_and(|p| p.maximized) { SW_SHOWMAXIMIZED } else { SW_SHOW });
 
         // Frame loop: render while anything moves (each present waits for the display's vertical
         // blank, which paces animation at the monitor's refresh rate), otherwise sleep until input.
@@ -305,7 +317,7 @@ impl App {
                     path.display()
                 ))
             }),
-            Source::Help => parse_markdown(HELP_MD),
+            Source::Help => parse_markdown(&HELP_MD.replace("{version}", env!("CARGO_PKG_VERSION"))),
         };
         self.mtime = match &source {
             Source::File(path) => file_mtime(path),
@@ -321,6 +333,9 @@ impl App {
         self.link_fx.clear();
         self.code_hover = None;
         self.flash = None;
+        if let Some(f) = self.find.as_mut() {
+            f.current = 0;
+        }
         if !keep_scroll {
             self.scroll.set(0.0);
         }
@@ -343,6 +358,7 @@ impl App {
     fn navigate(&mut self, source: Source, fragment: Option<String>) {
         if source != self.source {
             self.history.push((self.source.clone(), self.scroll.value));
+            self.forward.clear();
             self.load(source, false);
         }
         self.pending_fragment = fragment;
@@ -351,8 +367,203 @@ impl App {
 
     fn back(&mut self) {
         if let Some((source, scroll)) = self.history.pop() {
+            self.forward.push((self.source.clone(), self.scroll.value));
             self.load(source, false);
             self.scroll.set(scroll);
+        }
+    }
+
+    fn go_forward(&mut self) {
+        if let Some((source, scroll)) = self.forward.pop() {
+            self.history.push((self.source.clone(), self.scroll.value));
+            self.load(source, false);
+            self.scroll.set(scroll);
+        }
+    }
+
+    // --- Find in page (Ctrl+F) ---
+
+    fn open_find(&mut self) {
+        self.switcher = None;
+        if self.find.is_none() {
+            self.find = Some(Find { query: self.last_query.clone(), matches: Vec::new(), current: 0, doc_gen: 0, theme_gen: 0 });
+            self.find_changed();
+        }
+        self.invalidate();
+    }
+
+    fn close_find(&mut self) {
+        if let Some(f) = self.find.take() {
+            self.last_query = f.query;
+        }
+        self.invalidate();
+    }
+
+    fn find_type(&mut self, c: char) {
+        if let Some(f) = self.find.as_mut() {
+            f.query.push(c);
+            self.find_changed();
+        }
+    }
+
+    fn find_backspace(&mut self) {
+        if let Some(f) = self.find.as_mut() {
+            f.query.pop();
+            self.find_changed();
+        }
+    }
+
+    /// Recomputes matches after the query changed and jumps to the first one at or below the view.
+    fn find_changed(&mut self) {
+        self.refresh_find(true);
+        let from_item = self.renderer.layout().map_or(0, |l| l.item_at_y(self.scroll.value));
+        if let Some(f) = self.find.as_mut() {
+            self.last_query = f.query.clone();
+            let next = f.matches.partition_point(|m| m.0.item < from_item);
+            f.current = if next < f.matches.len() { next } else { 0 };
+        }
+        self.find_goto();
+    }
+
+    /// Recomputes matches when the document or layout changed under an open bar.
+    fn refresh_find(&mut self, force: bool) {
+        let Some(f) = self.find.as_mut() else { return };
+        if !force && f.doc_gen == self.doc_gen && f.theme_gen == self.theme_gen {
+            return;
+        }
+        // Search covers the whole document, so finish laying it out.
+        let _ = self.renderer.finish_layout(&self.doc);
+        f.matches = self.renderer.layout().map(|l| l.find_all(&f.query)).unwrap_or_default();
+        f.current = f.current.min(f.matches.len().saturating_sub(1));
+        f.doc_gen = self.doc_gen;
+        f.theme_gen = self.theme_gen;
+    }
+
+    fn find_step(&mut self, dir: isize) {
+        let Some(f) = self.find.as_mut() else { return };
+        let n = f.matches.len();
+        if n > 0 {
+            f.current = ((f.current as isize + dir).rem_euclid(n as isize)) as usize;
+        }
+        self.find_goto();
+    }
+
+    /// F3 / Shift+F3 with the bar closed: reopen it with the last query.
+    fn find_again(&mut self, backwards: bool) {
+        if self.find.is_none() {
+            if self.last_query.is_empty() {
+                return;
+            }
+            self.open_find();
+        } else {
+            self.find_step(if backwards { -1 } else { 1 });
+        }
+    }
+
+    /// Scrolls the current match into view (a third of the way down) if it isn't visible.
+    fn find_goto(&mut self) {
+        let Some(m) = self.find.as_ref().and_then(|f| f.matches.get(f.current).copied()) else {
+            self.invalidate();
+            return;
+        };
+        let (_, vh) = self.view_size();
+        if let Some(r) = self.renderer.layout().and_then(|l| l.match_rects(m).into_iter().next()) {
+            let top = self.scroll.target;
+            if r.top < top + 40.0 || r.bottom > top + vh - 40.0 {
+                self.scroll_to(r.top - vh * 0.35);
+            }
+        }
+        self.invalidate();
+    }
+
+    /// Text for the bottom-left strip: where the hovered link goes.
+    fn status_text(&self) -> Option<String> {
+        let url = self.renderer.layout()?.link_url(self.hover_link?)?;
+        Some(match url.strip_prefix(WIKI_PREFIX) {
+            Some(page) => format!("[[{page}]]"),
+            None => url.to_string(),
+        })
+    }
+
+    /// Right-click menu: the keyboard shortcuts, for people who prefer a mouse.
+    fn context_menu(&mut self, x: f32, y: f32) {
+        const COPY: usize = 1;
+        const SELECT_ALL: usize = 2;
+        const FIND: usize = 3;
+        const OPEN: usize = 4;
+        const THEMES: usize = 5;
+        const HELP: usize = 6;
+        const OPEN_LINK: usize = 7;
+        const COPY_LINK: usize = 8;
+        let (dx, dy) = self.to_doc(x, y);
+        let link = self.renderer.layout().and_then(|l| l.link_at(dx, dy)).map(str::to_string);
+        let has_selection = self.ordered_selection().is_some();
+        let cmd = unsafe {
+            let Ok(menu) = CreatePopupMenu() else { return };
+            let add = |flags: MENU_ITEM_FLAGS, id: usize, text: &str| {
+                let t = wide(text);
+                let _ = AppendMenuW(menu, flags, id, PCWSTR(t.as_ptr()));
+            };
+            if link.is_some() {
+                add(MF_STRING, OPEN_LINK, "Open link");
+                add(MF_STRING, COPY_LINK, "Copy link address");
+                add(MF_SEPARATOR, 0, "");
+            }
+            add(if has_selection { MF_STRING } else { MF_STRING | MF_GRAYED }, COPY, "Copy\tCtrl+C");
+            add(MF_STRING, SELECT_ALL, "Select all\tCtrl+A");
+            add(MF_SEPARATOR, 0, "");
+            add(MF_STRING, FIND, "Find in page…\tCtrl+F");
+            add(MF_STRING, OPEN, "Open file…\tCtrl+O");
+            add(MF_STRING, THEMES, "Themes…\tCtrl+T");
+            add(MF_SEPARATOR, 0, "");
+            add(MF_STRING, HELP, "Help\tF1");
+            // Open where the click (or caret) is, in screen pixels.
+            let s = self.dpi as f32 / 96.0;
+            let mut pt = POINT { x: (x * s) as i32, y: (y * s) as i32 };
+            let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut pt);
+            let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, self.hwnd, None).0 as usize;
+            let _ = DestroyMenu(menu);
+            cmd
+        };
+        match cmd {
+            COPY => self.copy_selection(),
+            SELECT_ALL => {
+                let _ = self.renderer.finish_layout(&self.doc);
+                self.selection = self.renderer.layout().and_then(|l| l.select_all());
+                self.invalidate();
+            }
+            FIND => self.open_find(),
+            OPEN => self.open_dialog(),
+            THEMES => self.toggle_switcher(),
+            HELP => self.navigate(Source::Help, None),
+            OPEN_LINK => {
+                if let Some(url) = link {
+                    self.open_link(&url);
+                }
+            }
+            COPY_LINK => {
+                if let Some(url) = link {
+                    let shown = url.strip_prefix(WIKI_PREFIX).map_or(url.clone(), |p| format!("[[{p}]]"));
+                    let _ = set_clipboard_text(self.hwnd, &shown);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Remembers the window's restored rectangle and maximized state for next launch.
+    fn save_placement(&self) {
+        let mut wp = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+        if unsafe { GetWindowPlacement(self.hwnd, &mut wp) }.is_ok() {
+            let r = wp.rcNormalPosition;
+            let placement = WindowPlacement {
+                x: r.left,
+                y: r.top,
+                width: r.right - r.left,
+                height: r.bottom - r.top,
+                maximized: wp.showCmd == SW_SHOWMAXIMIZED.0 as u32,
+            };
+            Config::update(|c| c.window = Some(placement));
         }
     }
 
@@ -506,6 +717,8 @@ impl App {
                 self.zoom_anchor = Some((layout.block_at(doc_y), view_y));
             }
             self.zoom.committed = self.zoom.target;
+            let zoom = self.zoom.target;
+            Config::update(|c| c.zoom = if (zoom - 1.0).abs() < 0.001 { None } else { Some(zoom) });
         }
 
         for (_, f) in self.row_fx.iter_mut() {
@@ -563,6 +776,9 @@ impl App {
         let layout_started = Instant::now();
         let fresh = self.ensure_layout();
         let layout_ms = layout_started.elapsed().as_secs_f32() * 1000.0;
+        self.refresh_find(fresh);
+        let matches: &[(TextPos, TextPos)] = self.find.as_ref().map_or(&[], |f| &f.matches);
+        let status = self.status_text();
 
         let rows: Vec<(usize, f32)> = self.row_fx.iter().map(|&(r, f)| (r, f.value)).collect();
         let links: Vec<((usize, usize), f32)> = self.link_fx.iter().map(|&(l, f)| (l, f.value)).collect();
@@ -597,6 +813,10 @@ impl App {
                 hover: sw.hover,
                 stats: self.switch_stats.clone(),
             }),
+            matches,
+            current_match: self.find.as_ref().filter(|f| !f.matches.is_empty()).map(|f| f.current),
+            find: self.find.as_ref().map(|f| FindView { query: f.query.clone(), count: f.matches.len(), current: f.current }),
+            status,
         };
         match self.renderer.render(&self.palette, &view) {
             Ok(true) => {
@@ -975,6 +1195,26 @@ impl App {
         if self.switcher.is_some() && !ctrl && self.switcher_key(vk, shift) {
             return true;
         }
+        if self.find.is_some() {
+            match vk {
+                VK_ESCAPE => {
+                    self.close_find();
+                    return true;
+                }
+                VK_RETURN | VK_F3 => {
+                    self.find_step(if shift { -1 } else { 1 });
+                    return true;
+                }
+                VK_BACK => {
+                    self.find_backspace();
+                    return true;
+                }
+                // Scrolling still works around the bar; everything else types into it (WM_CHAR).
+                VK_UP | VK_DOWN | VK_NEXT | VK_PRIOR => {}
+                _ if !ctrl => return true,
+                _ => {}
+            }
+        }
         let (_, vh) = self.view_size();
         let line = self.line_height() * 2.0;
         let page = (vh - self.line_height() * 2.0).max(self.line_height());
@@ -990,7 +1230,20 @@ impl App {
                 self.scroll_to(f32::MAX);
             }
             VK_F1 => self.navigate(Source::Help, None),
+            VK_APPS => {
+                // Keyboard context menu: at the selection if there is one, else mid-window.
+                let (vw, vh) = self.view_size();
+                let at = self.ordered_selection().and_then(|(s, _)| {
+                    let l = self.renderer.layout()?;
+                    let r = l.match_rects((s, TextPos { item: s.item, pos: s.pos + 1 })).into_iter().next()?;
+                    Some((r.left, r.bottom - self.scroll.value))
+                });
+                let (x, y) = at.filter(|&(_, y)| y > 0.0 && y < vh).unwrap_or((vw / 2.0, vh / 2.0));
+                self.context_menu(x, y);
+            }
+            VK_F3 => self.find_again(shift),
             VK_F5 => self.reload(),
+            VK_F if ctrl => self.open_find(),
             VK_BACK => self.back(),
             VK_ESCAPE => {
                 self.selection = None;
@@ -1082,10 +1335,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_XBUTTONUP => {
-            if ((wparam.0 >> 16) & 0xffff) as u16 == 1 {
-                app.back();
+            match ((wparam.0 >> 16) & 0xffff) as u16 {
+                1 => app.back(),
+                2 => app.go_forward(),
+                _ => {}
             }
             LRESULT(1)
+        }
+        WM_RBUTTONUP => {
+            let (x, y) = app.point(lparam);
+            app.context_menu(x, y);
+            LRESULT(0)
+        }
+        WM_CHAR => {
+            if app.find.is_some() {
+                // Astral characters arrive as two surrogate units, which from_u32 rejects; emoji
+                // can't be typed into the box, everything in the BMP can.
+                if let Some(c) = char::from_u32(wparam.0 as u32).filter(|c| !c.is_control()) {
+                    app.find_type(c);
+                }
+            }
+            LRESULT(0)
         }
         WM_SETCURSOR if (lparam.0 & 0xffff) as u32 == HTCLIENT => {
             let id = match app.cursor {
@@ -1109,6 +1379,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             app.back();
             LRESULT(0)
         }
+        WM_SYSKEYDOWN if VIRTUAL_KEY(wparam.0 as u16) == VK_RIGHT => {
+            app.go_forward();
+            LRESULT(0)
+        }
         WM_TIMER => {
             if wparam.0 == TIMER_WATCH {
                 app.check_file_changed();
@@ -1127,6 +1401,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_DESTROY => {
+            app.save_placement();
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             drop(Box::from_raw(app as *mut App));
             PostQuitMessage(0);
@@ -1145,6 +1420,24 @@ fn load_small_icon(instance: HINSTANCE) -> HICON {
             .map(|h| HICON(h.0))
             .unwrap_or_default()
     }
+}
+
+/// A saved window rectangle is only reused if it is a sensible size and at least partly on a
+/// monitor that still exists (the virtual screen spans all of them).
+fn placement_is_visible(p: WindowPlacement) -> bool {
+    if p.width < 320 || p.height < 240 {
+        return false;
+    }
+    let (vx, vy, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    let margin = 60;
+    p.x + p.width > vx + margin && p.x < vx + vw - margin && p.y + margin > vy && p.y < vy + vh - margin
 }
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {

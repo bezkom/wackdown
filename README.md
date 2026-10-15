@@ -109,7 +109,9 @@ Not supported: Mermaid diagrams render as code blocks.
 | Reload file and themes | `F5` (files also reload automatically when saved) |
 | Select / copy text | Drag, `Shift`+click, double-click, `Ctrl+A`, `Ctrl+C` |
 | Follow link | Click — `#anchors` scroll, relative `.md` links open in place, URLs open in the browser |
-| Back | `Backspace`, `Alt+←`, mouse back button |
+| Find in page | `Ctrl+F`, then type; `Enter` / `Shift+Enter` or `F3` / `Shift+F3` step through matches, `Esc` closes |
+| Back / forward | `Backspace` or `Alt+←` / `Alt+→`, mouse back and forward buttons |
+| Context menu | Right-click: copy, select all, find, open, themes, help; on a link: open it or copy its address |
 | Open file | `Ctrl+O` or drag and drop |
 | Help | `F1` |
 
@@ -143,7 +145,8 @@ anything unavailable falls back to embedded Iosevka.
 | Nordic Fjord | Iosevka Aile | Iosevka Etoile |
 | Paper & Gutenberg | Iosevka Etoile | Iosevka Etoile |
 
-The selected theme is remembered in `%APPDATA%\WackDown\config.json`.
+The selected theme, zoom level and window size and position are remembered in
+`%APPDATA%\WackDown\config.json`. That file is the entire configuration.
 
 ## Building for Windows 64
 Requires the Rust MSVC toolchain (`rustup`) and Visual Studio's **MSVC Build Tools for x64/x86** plus a
