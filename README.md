@@ -200,6 +200,26 @@ separately so small sizes stay sharp, and writes
 `wackdown.ico` (app) and `document.ico` (`.md` files). `build.rs` embeds both into the exe, together with
 version info taken from `Cargo.toml`.
 
+## Code signing policy
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by
+[SignPath Foundation](https://signpath.org/) *(application in progress; releases are unsigned until
+it is approved)*.
+
+- **What is signed:** `wackdown.exe` and the installer `wackdown-setup-<version>.exe`, built from this
+  repository's source by the [Release workflow](.github/workflows/release.yml) on GitHub Actions.
+  The installer is produced with [Inno Setup](https://jrsoftware.org/isinfo.php) (open source).
+- **Team:** this is a single-maintainer project.
+  - Committers and reviewers: [bezkom](https://github.com/bezkom)
+  - Approvers: [bezkom](https://github.com/bezkom)
+- **Approval:** every signing request is approved manually by an approver; all team members use
+  multi-factor authentication for GitHub and SignPath.
+
+### Privacy policy
+This program will not transfer any information to other networked systems unless specifically
+requested by the user or the person installing or operating it. ƜackDown has no network code: it
+reads the files you open and its own settings in `%APPDATA%\WackDown`, and only opens a web link in
+your default browser when you click it.
+
 ## License
 ƜackDown is free software: you can redistribute it and/or modify it under the terms of the
 GNU General Public License as published by the Free Software Foundation, either version 3 of the

@@ -53,7 +53,7 @@ jobs:
           $notes = @"
           **Download** ``wackdown-setup-$env:VERSION.exe`` (installer, no admin needed) or the portable ``wackdown-$env:VERSION-x64-portable.exe``. Windows 10/11 x64.
 
-          The files are not code-signed yet, so Windows SmartScreen may warn: choose **More info → Run anyway**. Verify downloads against ``SHA256SUMS.txt``.
+          The files are not code-signed yet, so Windows SmartScreen may warn: choose **More info → Run anyway**. Verify downloads against ``SHA256SUMS.txt``. See the [code signing policy](https://github.com/bezkom/wackdown#code-signing-policy).
           "@
           gh release create "${{ github.ref_name }}" `
             "dist/wackdown-setup-$env:VERSION.exe" `
