@@ -371,6 +371,11 @@ pub(crate) struct LayoutBuilder {
     /// Breakout column for top-level code blocks and tables.
     wide_left: f32,
     wide_right: f32,
+    /// Wide tables may use the whole window width (minus padding), beyond `maxWidth`.
+    full_left: f32,
+    full_right: f32,
+    table_body: IDWriteTextFormat,
+    table_bold: IDWriteTextFormat,
     indent_step: f32,
     quote_step: f32,
     body: IDWriteTextFormat,
@@ -449,6 +454,12 @@ impl LayoutBuilder {
         let prose_w = if l.measure > 0.0 { (l.measure * avg).min(wide_w) } else { wide_w };
         let center = pad_x + outer_w / 2.0;
 
+        let table_size = fs * t.table_scale.clamp(0.5, 1.5);
+        let table_line = table_size * lh;
+        let table_baseline = faces.body.metrics.baseline(table_size, table_line);
+        let table_body = mk(&faces.body, table_size, false, table_line, table_baseline)?;
+        let table_bold = mk(&faces.body, table_size, true, table_line, table_baseline)?;
+
         let builder = Self {
             dwrite: dwrite.clone(),
             target: target.clone(),
@@ -464,6 +475,10 @@ impl LayoutBuilder {
             right: center + prose_w / 2.0,
             wide_left: center - wide_w / 2.0,
             wide_right: center + wide_w / 2.0,
+            full_left: pad_x,
+            full_right: pad_x + outer_w,
+            table_body,
+            table_bold,
             indent_step: fs * 1.8,
             quote_step: fs * 1.2,
             body,
@@ -533,13 +548,13 @@ impl LayoutBuilder {
     }
 
     /// Column for a block whose content wants `needed` width: the given column if it fits,
-    /// otherwise widened symmetrically around the page center, up to the breakout column.
-    fn widen(&self, x: f32, w: f32, needed: f32, breakout: bool) -> (f32, f32) {
+    /// otherwise widened symmetrically around the page center, up to `limit` (left, right).
+    fn widen(&self, x: f32, w: f32, needed: f32, breakout: bool, (lo, hi): (f32, f32)) -> (f32, f32) {
         if !breakout || needed <= w {
             return (x, w);
         }
-        let wide = needed.min(self.wide_right - self.wide_left);
-        let center = (self.wide_left + self.wide_right) / 2.0;
+        let wide = needed.min(hi - lo);
+        let center = (lo + hi) / 2.0;
         (center - wide / 2.0, wide)
     }
 
@@ -899,7 +914,7 @@ impl LayoutBuilder {
         // No wrapping: long lines scroll horizontally instead of breaking mid-token.
         let tl = self.text_layout(&units, &self.code.clone(), 1.0e6)?;
         let natural = metrics(&tl).widthIncludingTrailingWhitespace;
-        let (x, w) = self.widen(x, w, natural + 2.0 * pad, breakout);
+        let (x, w) = self.widen(x, w, natural + 2.0 * pad, breakout, (self.wide_left, self.wide_right));
 
         let mut header_h = 0.0;
         if !lang.is_empty() {
@@ -980,39 +995,35 @@ impl LayoutBuilder {
         if ncols == 0 || rows.is_empty() {
             return Ok(0.0);
         }
-        let px = self.fs * 0.7;
-        let py = self.fs * 0.4;
+        let ts = unsafe { self.table_body.GetFontSize() };
+        let px = ts * 0.65;
+        let py = ts * 0.4;
         let top = self.y;
+        let full = (self.full_left, self.full_right);
 
-        // Measure natural column widths (against the widest column this table could get).
+        // Per column: natural width (no wrapping) and min-content width (longest unbreakable
+        // word, so identifiers like `Api.Integrators` never split), measured against the widest
+        // area this table could get.
         let empty = InlineText::default();
-        let measure_w = if breakout { (self.wide_right - self.wide_left).max(w) } else { w };
-        let mut natural = vec![self.fs; ncols];
+        let measure_w = if breakout { (full.1 - full.0).max(w) } else { w };
+        let mut natural = vec![ts; ncols];
+        let mut min_content = vec![ts; ncols];
         for (ri, row) in rows.iter().enumerate() {
-            let format = if ri == 0 { self.body_bold.clone() } else { self.body.clone() };
-            for (c, nat) in natural.iter_mut().enumerate() {
+            let format = if ri == 0 { self.table_bold.clone() } else { self.table_body.clone() };
+            for c in 0..ncols {
                 let cell = row.get(c).unwrap_or(&empty);
                 let tl = self.text_layout(&cell.text, &format, measure_w)?;
-                *nat = nat.max(metrics(&tl).widthIncludingTrailingWhitespace.ceil() + 1.0);
+                natural[c] = natural[c].max(metrics(&tl).widthIncludingTrailingWhitespace.ceil() + 1.0);
+                let min = unsafe { tl.DetermineMinWidth() }.unwrap_or(0.0);
+                min_content[c] = min_content[c].max(min.ceil() + 1.0);
             }
         }
-        // Tables that fit stay left-aligned with the prose; wider ones widen around the center.
+        // Tables that fit stay left-aligned with the prose; wider ones widen around the center,
+        // up to the full window width.
         let needed = natural.iter().sum::<f32>() + ncols as f32 * 2.0 * px;
-        let (x, w) = self.widen(x, w, needed, breakout);
-        let avail = w - ncols as f32 * 2.0 * px;
-        let total_natural: f32 = natural.iter().sum();
-        let widths: Vec<f32> = if total_natural <= avail {
-            natural.clone()
-        } else {
-            let mins: Vec<f32> = natural.iter().map(|n| n.min(self.fs * 5.0)).collect();
-            let extra = avail - mins.iter().sum::<f32>();
-            let flex: f32 = natural.iter().zip(&mins).map(|(n, m)| n - m).sum();
-            natural
-                .iter()
-                .zip(&mins)
-                .map(|(n, m)| if extra > 0.0 && flex > 0.0 { m + (n - m) / flex * extra } else { *m })
-                .collect()
-        };
+        let (x, w) = self.widen(x, w, needed, breakout, full);
+        let avail = (w - ncols as f32 * 2.0 * px).max(ts * ncols as f32);
+        let widths = column_widths(&natural, &min_content, avail);
         let table_w: f32 = widths.iter().map(|cw| cw + 2.0 * px).sum();
         let col_x: Vec<f32> = widths
             .iter()
@@ -1027,7 +1038,7 @@ impl LayoutBuilder {
         let mut row_tops = Vec::new();
         let mut y = top;
         for (ri, row) in rows.iter().enumerate() {
-            let format = if ri == 0 { self.body_bold.clone() } else { self.body.clone() };
+            let format = if ri == 0 { self.table_bold.clone() } else { self.table_body.clone() };
             let mut row_h = 0.0f32;
             for c in 0..ncols {
                 let cell = row.get(c).unwrap_or(&empty);
@@ -1072,6 +1083,76 @@ impl LayoutBuilder {
         push(&mut layout.decos, top, bottom, Deco::Stroke { rect: outer, color: self.pal.table_border, radius, width: self.z });
         self.y = top;
         Ok(bottom - top)
+    }
+}
+
+/// Table column widths, like a browser's automatic table layout: natural widths when they fit;
+/// otherwise every column first gets its min-content width (its longest unbreakable word), and
+/// the remaining space is shared max-min fairly: columns that want little more get all of it,
+/// the rest split what is left evenly. Narrow columns end up unwrapped, wide prose wraps.
+fn column_widths(natural: &[f32], min_content: &[f32], avail: f32) -> Vec<f32> {
+    if natural.iter().sum::<f32>() <= avail {
+        return natural.to_vec();
+    }
+    // One huge unbreakable cell (a long URL) may not starve every other column.
+    let cap = if natural.len() > 1 { avail * 0.5 } else { avail };
+    let mins: Vec<f32> = natural.iter().zip(min_content).map(|(&n, &m)| m.min(n).min(cap)).collect();
+    let total_min: f32 = mins.iter().sum();
+    if total_min >= avail {
+        // Even whole words don't fit: shrink proportionally (words must break somewhere).
+        return mins.iter().map(|m| m * avail / total_min).collect();
+    }
+    let mut widths = mins.clone();
+    let mut remaining = avail - total_min;
+    let mut order: Vec<usize> = (0..natural.len()).collect();
+    order.sort_by(|&a, &b| (natural[a] - mins[a]).total_cmp(&(natural[b] - mins[b])));
+    for (k, &c) in order.iter().enumerate() {
+        let share = remaining / (order.len() - k) as f32;
+        let give = (natural[c] - mins[c]).max(0.0).min(share);
+        widths[c] += give;
+        remaining -= give;
+    }
+    widths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::column_widths;
+
+    #[test]
+    fn natural_widths_when_they_fit() {
+        assert_eq!(column_widths(&[100.0, 200.0], &[50.0, 80.0], 400.0), vec![100.0, 200.0]);
+    }
+
+    #[test]
+    fn whole_words_are_kept_when_space_is_short() {
+        // Identifier column (natural 120 = its single word) next to a long prose column.
+        let w = column_widths(&[120.0, 800.0], &[120.0, 90.0], 500.0);
+        assert!(w[0] >= 120.0, "identifier column was squeezed below its word: {w:?}");
+        assert!((w.iter().sum::<f32>() - 500.0).abs() < 0.01);
+        assert!(w[1] >= 90.0);
+    }
+
+    #[test]
+    fn huge_unbreakable_cell_cannot_starve_the_rest() {
+        let w = column_widths(&[2000.0, 300.0], &[2000.0, 60.0], 600.0);
+        // The URL column is capped at half; the other gets an even share of what's left.
+        assert!(w[0] <= 420.0 + 0.01 && w[1] >= 180.0 - 0.01, "{w:?}");
+        assert!((w.iter().sum::<f32>() - 600.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn small_columns_are_fully_satisfied_first() {
+        // Three short columns and one long prose column: the short ones must not wrap.
+        let w = column_widths(&[90.0, 110.0, 60.0, 900.0], &[80.0, 100.0, 40.0, 70.0], 700.0);
+        assert_eq!(&w[..3], &[90.0, 110.0, 60.0]);
+        assert!((w[3] - 440.0).abs() < 0.01, "{w:?}");
+    }
+
+    #[test]
+    fn shrinks_proportionally_when_even_words_do_not_fit() {
+        let w = column_widths(&[200.0, 200.0], &[200.0, 200.0], 100.0);
+        assert!((w[0] - 50.0).abs() < 0.01 && (w[1] - 50.0).abs() < 0.01, "{w:?}");
     }
 }
 

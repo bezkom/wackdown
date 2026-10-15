@@ -121,8 +121,10 @@ layout value falls back to something derived from those. A custom theme with the
 built-in one replaces it.
 
 `layout.measure` sets the reading width in characters of the body font (prose reads best at roughly
-65–90); `layout.maxWidth` caps it and is how far code blocks and tables may widen when their content
-needs the room.
+65–90); `layout.maxWidth` caps it and is how far code blocks may widen when their content needs the
+room. Wide tables may use the whole window width; `typography.tableScale` (default `0.9`) sets table
+text size relative to body text. Table columns are sized like a browser's automatic layout: each
+column keeps its longest word intact, short columns are never wrapped, and long prose cells wrap.
 
 Typography has three font roles, each a CSS-style list where the first available family wins:
 `fontFamily` (body text), `headingFontFamily` (defaults to the body font) and `codeFontFamily` (defaults

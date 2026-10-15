@@ -81,6 +81,8 @@ pub struct ThemeTypography {
     pub h5_scale: f32,
     pub h6_scale: f32,
     pub code_scale: f32,
+    /// Table text size relative to body text.
+    pub table_scale: f32,
     /// Body text. CSS-style list; see `Fonts::resolve`.
     pub font_family: String,
     /// Headings; defaults to the body font.
@@ -111,6 +113,7 @@ impl Default for ThemeTypography {
             h5_scale: 1.05,
             h6_scale: 1.0,
             code_scale: 0.92,
+            table_scale: 0.9,
             font_family: "monospace".into(),
             heading_font_family: None,
             code_font_family: None,
