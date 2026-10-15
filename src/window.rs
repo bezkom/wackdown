@@ -1,0 +1,1252 @@
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
+
+use windows::core::*;
+use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
+use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::UI::Controls::Dialogs::{GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW};
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::HiDpi::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP};
+use windows::Win32::UI::WindowsAndMessaging::*;
+
+use crate::anim::{ease_out, Fade, Spring};
+use crate::fonts::wide;
+use crate::layout::{TextPos, SCROLLBAR_HIT_WIDTH};
+use crate::parser::{parse_file_to_document, parse_markdown, Document, WIKI_PREFIX};
+use crate::renderer::{
+    scrollbar_geometry, switcher_rect, switcher_row_at, CodeChrome, Renderer, ScrollbarView, SwitcherEntry, SwitcherView, ViewState,
+};
+use crate::theme::{Palette, ThemeSet};
+
+const HELP_MD: &str = include_str!("help.md");
+const TIMER_WATCH: usize = 2;
+const WM_MOUSEHWHEEL: u32 = 0x020E;
+/// Icon resource 1 in wackdown.rc (MAKEINTRESOURCE(1)).
+const APP_ICON: PCWSTR = PCWSTR(1 as *const u16);
+const MIN_ZOOM: f32 = 0.5;
+const MAX_ZOOM: f32 = 3.0;
+/// Time per frame spent extending an incomplete layout.
+const LAYOUT_BUDGET: Duration = Duration::from_millis(6);
+/// Scrolling spring stiffness (rad/s).
+const SCROLL_OMEGA: f32 = 24.0;
+const FLASH: Duration = Duration::from_millis(1100);
+const COPIED: Duration = Duration::from_millis(1400);
+/// The overlay scrollbar stays visible this long after the last scroll.
+const SCROLLBAR_LINGER: Duration = Duration::from_millis(900);
+/// Zoom commits (re-lays out) once input has paused this long.
+const ZOOM_SETTLE: Duration = Duration::from_millis(140);
+
+#[derive(Clone, PartialEq)]
+enum Source {
+    File(PathBuf),
+    Help,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum CursorKind {
+    Arrow,
+    Hand,
+    IBeam,
+}
+
+struct Switcher {
+    /// Theme to restore on Esc.
+    original: usize,
+    hover: Option<usize>,
+}
+
+/// Fluid zoom: the layout stays at `committed` while the visual scale animates toward `target`.
+struct Zoom {
+    committed: f32,
+    visual: f32,
+    target: f32,
+    /// View y the zoom is centered on (the mouse, or the middle of the window).
+    anchor_y: f32,
+    last_input: Instant,
+}
+
+struct App {
+    hwnd: HWND,
+    renderer: Renderer,
+    themes: ThemeSet,
+    palette: Palette,
+    source: Source,
+    doc: Document,
+    doc_gen: u64,
+    laid_doc_gen: u64,
+    theme_gen: u64,
+    mtime: Option<SystemTime>,
+    history: Vec<(Source, f32)>,
+    pending_fragment: Option<String>,
+    scroll: Spring,
+    zoom: Zoom,
+    /// Block anchor to restore after a zoom relayout: (block, frac, view y).
+    zoom_anchor: Option<((usize, f32), f32)>,
+    /// (anchor, focus), unordered.
+    selection: Option<(TextPos, TextPos)>,
+    selecting: bool,
+    press_link: Option<String>,
+    drag_thumb: Option<f32>,
+    hover_row: Option<usize>,
+    hover_link: Option<(usize, usize)>,
+    row_fx: Vec<(usize, Fade)>,
+    link_fx: Vec<((usize, usize), Fade)>,
+    scrollbar_hot: bool,
+    scrollbar_hover: Fade,
+    scrollbar_visible: Fade,
+    last_scroll_activity: Instant,
+    code_hover: Option<usize>,
+    code_fade: Fade,
+    code_button_hot: bool,
+    copied: Option<(usize, Instant)>,
+    flash: Option<(String, Instant)>,
+    cursor: CursorKind,
+    tracking_leave: bool,
+    dpi: u32,
+    startup: Option<Instant>,
+    last_frame: Instant,
+    dirty: bool,
+    /// Ctrl+T theme picker, while open.
+    switcher: Option<Switcher>,
+    switcher_entries: Vec<SwitcherEntry>,
+    /// Set by a theme switch: time the next relayout + draw and show it in the picker.
+    measure_next: bool,
+    switch_stats: Option<String>,
+}
+
+fn switcher_entries(themes: &ThemeSet) -> Vec<SwitcherEntry> {
+    themes
+        .themes
+        .iter()
+        .map(|t| {
+            let p = t.palette();
+            SwitcherEntry { name: t.name.clone(), swatches: [p.background, p.headings[0], p.headings[1], p.headings[2]] }
+        })
+        .collect()
+}
+
+pub fn run_window_loop(file: Option<PathBuf>, startup_timer: Instant) -> Result<()> {
+    unsafe {
+        // Enforce Per-Monitor V2 High-DPI awareness
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+        let instance = GetModuleHandleW(None)?;
+        let class_name = w!("WackDown_WindowClass");
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
+            lpfnWndProc: Some(wndproc),
+            hInstance: instance.into(),
+            lpszClassName: class_name,
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hIcon: LoadIconW(instance, APP_ICON).unwrap_or_default(),
+            hIconSm: load_small_icon(instance.into()),
+            ..Default::default()
+        };
+        if RegisterClassExW(&wc) == 0 {
+            return Err(Error::from_win32());
+        }
+
+        let scale = GetDpiForSystem() as f32 / 96.0;
+        let hwnd = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            class_name,
+            w!("WackDown"),
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            (1100.0 * scale) as i32,
+            (850.0 * scale) as i32,
+            None,
+            None,
+            instance,
+            None,
+        )?;
+
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        let themes = ThemeSet::load();
+        let palette = themes.current().palette();
+        let source = match file {
+            Some(path) => Source::File(path),
+            None if Path::new("README.md").is_file() => Source::File(PathBuf::from("README.md")),
+            None => Source::Help,
+        };
+        let now = Instant::now();
+        let mut app = Box::new(App {
+            hwnd,
+            renderer: Renderer::new(hwnd, dpi)?,
+            themes,
+            palette,
+            source: Source::Help,
+            doc: Document::default(),
+            doc_gen: 0,
+            laid_doc_gen: 0,
+            theme_gen: 1,
+            mtime: None,
+            history: Vec::new(),
+            pending_fragment: None,
+            scroll: Spring::new(0.0, SCROLL_OMEGA),
+            zoom: Zoom { committed: 1.0, visual: 1.0, target: 1.0, anchor_y: 0.0, last_input: now },
+            zoom_anchor: None,
+            selection: None,
+            selecting: false,
+            press_link: None,
+            drag_thumb: None,
+            hover_row: None,
+            hover_link: None,
+            row_fx: Vec::new(),
+            link_fx: Vec::new(),
+            scrollbar_hot: false,
+            scrollbar_hover: Fade::default(),
+            scrollbar_visible: Fade::default(),
+            last_scroll_activity: now,
+            code_hover: None,
+            code_fade: Fade::default(),
+            code_button_hot: false,
+            copied: None,
+            flash: None,
+            cursor: CursorKind::Arrow,
+            tracking_leave: false,
+            dpi,
+            startup: Some(startup_timer),
+            last_frame: now,
+            dirty: true,
+            switcher: None,
+            switcher_entries: Vec::new(),
+            measure_next: false,
+            switch_stats: None,
+        });
+        app.switcher_entries = switcher_entries(&app.themes);
+        app.load(source, false);
+        app.apply_title_bar_theme();
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
+
+        DragAcceptFiles(hwnd, true);
+        SetTimer(hwnd, TIMER_WATCH, 700, None);
+        let _ = ShowWindow(hwnd, SW_SHOW);
+
+        // Frame loop: render while anything moves (each present waits for the display's vertical
+        // blank, which paces animation at the monitor's refresh rate), otherwise sleep until input.
+        let mut msg = MSG::default();
+        loop {
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                if msg.message == WM_QUIT {
+                    return Ok(());
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            match app_from(hwnd) {
+                Some(app) if app.dirty || app.animating() => {
+                    app.frame();
+                    let _ = ValidateRect(hwnd, None);
+                }
+                Some(_) => {
+                    let _ = WaitMessage();
+                }
+                None => return Ok(()),
+            }
+        }
+    }
+}
+
+impl App {
+    /// Requests a frame. Also invalidates the window so modal loops (live resize) repaint.
+    fn invalidate(&mut self) {
+        self.dirty = true;
+        unsafe {
+            let _ = InvalidateRect(self.hwnd, None, false);
+        }
+    }
+
+    fn view_size(&self) -> (f32, f32) {
+        self.renderer.view_size()
+    }
+
+    /// Mouse coordinates (physical pixels in lparam) to view DIPs.
+    fn point(&self, lparam: LPARAM) -> (f32, f32) {
+        let x = (lparam.0 & 0xffff) as i16 as f32;
+        let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32;
+        let s = 96.0 / self.dpi as f32;
+        (x * s, y * s)
+    }
+
+    /// Current visual zoom transform: (scale, center x, center y), if not identity.
+    fn zoom_transform(&self) -> Option<(f32, f32, f32)> {
+        let s = self.zoom.visual / self.zoom.committed;
+        ((s - 1.0).abs() > 0.0005).then(|| (s, self.view_size().0 / 2.0, self.zoom.anchor_y))
+    }
+
+    /// View point to document coordinates, undoing an in-flight zoom transform.
+    fn to_doc(&self, x: f32, y: f32) -> (f32, f32) {
+        match self.zoom_transform() {
+            Some((s, cx, cy)) => (cx + (x - cx) / s, cy + (y - cy) / s + self.scroll.value),
+            None => (x, y + self.scroll.value),
+        }
+    }
+
+    fn line_height(&self) -> f32 {
+        let t = &self.themes.current().typography;
+        t.font_size * t.line_height * self.zoom.committed
+    }
+
+    fn load(&mut self, source: Source, keep_scroll: bool) {
+        let doc = match &source {
+            Source::File(path) => parse_file_to_document(path).unwrap_or_else(|e| {
+                parse_markdown(&format!(
+                    "# Cannot open file\n\n`{}`\n\n{e}\n\nDrop a markdown file onto this window, press **Ctrl+O** to open one, or **F1** for help.",
+                    path.display()
+                ))
+            }),
+            Source::Help => parse_markdown(HELP_MD),
+        };
+        self.mtime = match &source {
+            Source::File(path) => file_mtime(path),
+            Source::Help => None,
+        };
+        self.doc = doc;
+        self.doc_gen += 1;
+        self.selection = None;
+        self.selecting = false;
+        self.hover_row = None;
+        self.hover_link = None;
+        self.row_fx.clear();
+        self.link_fx.clear();
+        self.code_hover = None;
+        self.flash = None;
+        if !keep_scroll {
+            self.scroll.set(0.0);
+        }
+        self.source = source;
+        self.update_title();
+        self.invalidate();
+    }
+
+    fn update_title(&self) {
+        let name = match &self.source {
+            Source::File(path) => path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()),
+            Source::Help => "Help".into(),
+        };
+        let title = wide(&format!("{name} — WackDown · {}", self.themes.current().name));
+        unsafe {
+            let _ = SetWindowTextW(self.hwnd, PCWSTR(title.as_ptr()));
+        }
+    }
+
+    fn navigate(&mut self, source: Source, fragment: Option<String>) {
+        if source != self.source {
+            self.history.push((self.source.clone(), self.scroll.value));
+            self.load(source, false);
+        }
+        self.pending_fragment = fragment;
+        self.invalidate();
+    }
+
+    fn back(&mut self) {
+        if let Some((source, scroll)) = self.history.pop() {
+            self.load(source, false);
+            self.scroll.set(scroll);
+        }
+    }
+
+    fn reload(&mut self) {
+        let current = self.themes.current().id.clone();
+        self.themes = ThemeSet::load();
+        if let Some(i) = self.themes.themes.iter().position(|t| t.id == current) {
+            self.themes.current = i;
+        }
+        self.switcher_entries = switcher_entries(&self.themes);
+        self.switcher = None;
+        self.on_theme_changed();
+        self.load(self.source.clone(), true);
+    }
+
+    fn on_theme_changed(&mut self) {
+        self.palette = self.themes.current().palette();
+        self.theme_gen += 1;
+        self.apply_title_bar_theme();
+        self.update_title();
+        self.invalidate();
+    }
+
+    /// Switches theme with a crossfade from the current frame. `persist` remembers the choice.
+    fn apply_theme(&mut self, index: usize, persist: bool) {
+        if index != self.themes.current && index < self.themes.themes.len() {
+            let view = ViewState { scroll: self.scroll.value.round(), selection: self.ordered_selection(), ..Default::default() };
+            let _ = self.renderer.begin_crossfade(&self.palette, &view);
+            self.themes.current = index;
+            self.measure_next = true;
+            self.on_theme_changed();
+        }
+        if persist {
+            self.themes.save();
+        }
+    }
+
+    fn toggle_switcher(&mut self) {
+        match self.switcher {
+            Some(_) => self.close_switcher(true),
+            None => {
+                self.switcher = Some(Switcher { original: self.themes.current, hover: None });
+                self.invalidate();
+            }
+        }
+    }
+
+    fn close_switcher(&mut self, keep: bool) {
+        let Some(sw) = self.switcher.take() else { return };
+        if keep {
+            self.themes.save();
+        } else {
+            self.apply_theme(sw.original, false);
+        }
+        self.invalidate();
+    }
+
+    fn switcher_key(&mut self, vk: VIRTUAL_KEY, shift: bool) -> bool {
+        let n = self.themes.themes.len();
+        let step = |cur: usize, forward: bool| if forward { (cur + 1) % n } else { (cur + n - 1) % n };
+        match vk {
+            VK_UP => self.apply_theme(step(self.themes.current, false), false),
+            VK_DOWN => self.apply_theme(step(self.themes.current, true), false),
+            VK_TAB | VK_T => self.apply_theme(step(self.themes.current, !shift), false),
+            VK_HOME => self.apply_theme(0, false),
+            VK_END => self.apply_theme(n - 1, false),
+            VK_RETURN => self.close_switcher(true),
+            VK_ESCAPE => self.close_switcher(false),
+            _ => return false,
+        }
+        true
+    }
+
+    fn apply_title_bar_theme(&self) {
+        let dark = BOOL::from(self.palette.background.luminance() < 0.5);
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                self.hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &dark as *const BOOL as *const _,
+                std::mem::size_of::<BOOL>() as u32,
+            );
+        }
+    }
+
+    /// Lays out enough of the document for this frame (plus a time slice of the rest), keeping
+    /// the reading position stable across relayouts. Returns true when a new layout began.
+    fn ensure_layout(&mut self) -> bool {
+        let (_, vh) = self.view_size();
+        let prior_anchor = self.renderer.layout().map(|l| l.block_at(self.scroll.value));
+        let need_block = self.zoom_anchor.map(|(a, _)| a.0).or(prior_anchor.map(|a| a.0)).unwrap_or(0);
+        let scale = self.zoom_transform().map_or(1.0, |(s, _, _)| s);
+        let need_y = self.scroll.value.max(self.scroll.target) + vh * 1.5 / scale.min(1.0);
+        let theme = self.themes.current();
+        let fresh = self
+            .renderer
+            .ensure_layout(&self.doc, theme, &self.palette, self.doc_gen, self.theme_gen, self.zoom.committed, need_y, need_block, LAYOUT_BUDGET)
+            .unwrap_or(false);
+        if fresh && self.laid_doc_gen == self.doc_gen {
+            if let Some((anchor, view_y)) = self.zoom_anchor.take() {
+                let y = self.renderer.layout().map_or(0.0, |l| l.block_y(anchor)) - view_y;
+                self.scroll.set(y);
+            } else if let Some(anchor) = prior_anchor {
+                let y = self.renderer.layout().map_or(0.0, |l| l.block_y(anchor));
+                let delta = self.scroll.target - self.scroll.value;
+                self.scroll.value = y;
+                self.scroll.target = y + delta;
+            }
+        }
+        self.laid_doc_gen = self.doc_gen;
+        if let Some(fragment) = self.pending_fragment.take() {
+            let _ = self.renderer.finish_layout(&self.doc);
+            if let Some(y) = self.renderer.layout().and_then(|l| l.anchor_y(&fragment)) {
+                self.scroll.set(y);
+                self.flash = Some((fragment, Instant::now()));
+            }
+        }
+        self.clamp_scroll();
+        fresh
+    }
+
+    fn clamp_scroll(&mut self) {
+        let max = self.max_scroll();
+        self.scroll.target = self.scroll.target.clamp(0.0, max);
+        if self.scroll.value > max || self.scroll.value < 0.0 {
+            self.scroll.value = self.scroll.value.clamp(0.0, max);
+            self.scroll.velocity = 0.0;
+        }
+    }
+
+    /// Advances every animation by the real time since the last frame.
+    fn tick(&mut self, dt: f32) {
+        let now = Instant::now();
+        let was_settled = self.scroll.settled();
+        self.scroll.step(dt);
+        if !was_settled {
+            self.last_scroll_activity = now;
+        }
+
+        // Fluid zoom: ease the visual scale, then re-lay out once input pauses.
+        let z = &mut self.zoom;
+        let k = 1.0 - (-20.0 * dt).exp();
+        z.visual += (z.target - z.visual) * k;
+        if (z.target - z.visual).abs() < 0.001 {
+            z.visual = z.target;
+        }
+        if z.visual == z.target && z.committed != z.target && now.duration_since(z.last_input) >= ZOOM_SETTLE {
+            let view_y = z.anchor_y;
+            let doc_y = self.scroll.value + view_y;
+            if let Some(layout) = self.renderer.layout() {
+                self.zoom_anchor = Some((layout.block_at(doc_y), view_y));
+            }
+            self.zoom.committed = self.zoom.target;
+        }
+
+        for (_, f) in self.row_fx.iter_mut() {
+            f.step(dt, 14.0);
+        }
+        self.row_fx.retain(|(_, f)| f.on || f.value > 0.0);
+        for (_, f) in self.link_fx.iter_mut() {
+            f.step(dt, 14.0);
+        }
+        self.link_fx.retain(|(_, f)| f.on || f.value > 0.0);
+
+        self.scrollbar_hover.on = self.scrollbar_hot || self.drag_thumb.is_some();
+        self.scrollbar_hover.step(dt, 14.0);
+        self.scrollbar_visible.on = self.scrollbar_hover.on || now.duration_since(self.last_scroll_activity) < SCROLLBAR_LINGER;
+        self.scrollbar_visible.step(dt, 10.0);
+
+        self.code_fade.on = self.code_hover.is_some();
+        self.code_fade.step(dt, 14.0);
+
+        if self.flash.as_ref().is_some_and(|(_, t)| t.elapsed() > FLASH) {
+            self.flash = None;
+        }
+        if self.copied.is_some_and(|(_, t)| t.elapsed() > COPIED) {
+            self.copied = None;
+        }
+    }
+
+    /// Whether frames should keep coming without new input.
+    fn animating(&self) -> bool {
+        !self.scroll.settled()
+            || self.zoom.visual != self.zoom.target
+            || self.zoom.committed != self.zoom.target
+            || self.row_fx.iter().any(|(_, f)| f.moving())
+            || self.link_fx.iter().any(|(_, f)| f.moving())
+            || self.scrollbar_hover.moving()
+            || self.scrollbar_visible.moving()
+            || self.scrollbar_visible.on
+            || self.code_fade.moving()
+            || self.flash.is_some()
+            || self.copied.is_some()
+            || self.renderer.animating()
+            || !self.renderer.layout_complete()
+    }
+
+    fn frame(&mut self) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.05);
+        self.last_frame = now;
+        self.dirty = false;
+        self.tick(dt);
+        self.paint();
+    }
+
+    fn paint(&mut self) {
+        let layout_started = Instant::now();
+        let fresh = self.ensure_layout();
+        let layout_ms = layout_started.elapsed().as_secs_f32() * 1000.0;
+
+        let rows: Vec<(usize, f32)> = self.row_fx.iter().map(|&(r, f)| (r, f.value)).collect();
+        let links: Vec<((usize, usize), f32)> = self.link_fx.iter().map(|&(l, f)| (l, f.value)).collect();
+        let flash = self.flash.as_ref().and_then(|(name, t)| {
+            let rect = self.renderer.layout()?.anchor_rect(name)?;
+            let p = t.elapsed().as_secs_f32() / FLASH.as_secs_f32();
+            // Quick fade in, slow fade out.
+            let alpha = if p < 0.15 { p / 0.15 } else { 1.0 - ease_out((p - 0.15) / 0.85) };
+            Some((rect, alpha))
+        });
+        let view = ViewState {
+            scroll: self.scroll.value.round(),
+            selection: self.ordered_selection(),
+            rows: &rows,
+            links: &links,
+            scrollbar: ScrollbarView {
+                width: 4.0 + 5.0 * self.scrollbar_hover.value,
+                alpha: self.scrollbar_visible.value,
+                track: self.scrollbar_hover.value,
+            },
+            zoom: self.zoom_transform(),
+            flash,
+            code: self.code_hover.filter(|_| self.code_fade.value > 0.0).or(self.copied.map(|(c, _)| c)).map(|code| CodeChrome {
+                code,
+                alpha: self.code_fade.value.max(if self.copied.is_some() { 1.0 } else { 0.0 }),
+                button_hot: self.code_button_hot,
+                copied: self.copied.is_some_and(|(c, _)| c == code),
+            }),
+            switcher: self.switcher.as_ref().map(|sw| SwitcherView {
+                entries: &self.switcher_entries,
+                selected: self.themes.current,
+                hover: sw.hover,
+                stats: self.switch_stats.clone(),
+            }),
+        };
+        match self.renderer.render(&self.palette, &view) {
+            Ok(true) => {
+                if let Some(start) = self.startup.take() {
+                    let msg = wide(&format!("[WackDown] first frame in {:?}\n", start.elapsed()));
+                    unsafe { OutputDebugStringW(PCWSTR(msg.as_ptr())) };
+                }
+                if self.measure_next && fresh {
+                    self.measure_next = false;
+                    let laid = self.renderer.layout().map_or(0, |l| l.laid_blocks());
+                    self.switch_stats = Some(format!("{laid} blocks · layout {layout_ms:.1} ms · draw {:.1} ms", self.renderer.last_draw_ms));
+                }
+            }
+            Ok(false) => self.invalidate(),
+            Err(_) => {}
+        }
+    }
+
+    fn max_scroll(&self) -> f32 {
+        self.renderer.layout().map_or(0.0, |l| l.max_scroll(self.view_size().1))
+    }
+
+    /// Animated scroll to an absolute position.
+    fn scroll_to(&mut self, y: f32) {
+        self.scroll.target = y.clamp(0.0, self.max_scroll());
+        self.last_scroll_activity = Instant::now();
+        self.invalidate();
+    }
+
+    fn scroll_by(&mut self, dy: f32) {
+        self.scroll_to(self.scroll.target + dy);
+    }
+
+    /// Immediate scroll (thumb drag, selection auto-scroll).
+    fn jump_to(&mut self, y: f32) {
+        self.scroll.set(y.clamp(0.0, self.max_scroll()));
+        self.last_scroll_activity = Instant::now();
+        self.invalidate();
+    }
+
+    /// Starts or retargets a zoom gesture centered on view y `anchor_y`.
+    fn zoom_to(&mut self, zoom: f32, anchor_y: f32) {
+        let z = (zoom * 100.0).round().clamp(MIN_ZOOM * 100.0, MAX_ZOOM * 100.0) / 100.0;
+        if self.zoom.visual == self.zoom.committed {
+            // New gesture: pin it to where it started.
+            self.zoom.anchor_y = anchor_y;
+        }
+        self.zoom.target = z;
+        self.zoom.last_input = Instant::now();
+        self.invalidate();
+    }
+
+    fn ordered_selection(&self) -> Option<(TextPos, TextPos)> {
+        let (a, b) = self.selection?;
+        if a == b {
+            return None;
+        }
+        Some(if a <= b { (a, b) } else { (b, a) })
+    }
+
+    fn copy_selection(&self) {
+        let (Some(sel), Some(layout)) = (self.ordered_selection(), self.renderer.layout()) else { return };
+        let text = layout.selected_text(sel);
+        if !text.is_empty() {
+            let _ = set_clipboard_text(self.hwnd, &text);
+        }
+    }
+
+    fn open_link(&mut self, url: &str) {
+        let url = url.trim();
+        if let Some(page) = url.strip_prefix(WIKI_PREFIX) {
+            self.open_wiki_link(page);
+            return;
+        }
+        if let Some(fragment) = url.strip_prefix('#') {
+            let _ = self.renderer.finish_layout(&self.doc);
+            if let Some(y) = self.renderer.layout().and_then(|l| l.anchor_y(fragment)) {
+                self.scroll_to(y);
+                self.flash = Some((fragment.to_string(), Instant::now()));
+            }
+            return;
+        }
+        if has_scheme(url) {
+            shell_open(self.hwnd, url);
+            return;
+        }
+        // Relative path: resolve against the current document's folder.
+        let (path_part, fragment) = match url.split_once('#') {
+            Some((p, f)) => (p, Some(f.to_string())),
+            None => (url, None),
+        };
+        let base = match &self.source {
+            Source::File(p) => p.parent().map(Path::to_path_buf).unwrap_or_default(),
+            Source::Help => std::env::current_dir().unwrap_or_default(),
+        };
+        let target = base.join(percent_decode(path_part));
+        if is_markdown(&target) {
+            self.navigate(Source::File(target), fragment);
+        } else if target.exists() {
+            shell_open(self.hwnd, &target.to_string_lossy());
+        }
+    }
+
+    /// `[[Page]]` / `[[Page#Heading]]`: opens `Page.md` (or `Page.markdown`, or `Page` itself)
+    /// next to the current document.
+    fn open_wiki_link(&mut self, page: &str) {
+        let (name, fragment) = match page.split_once('#') {
+            Some((n, f)) => (n.trim(), Some(f.trim().to_string())),
+            None => (page.trim(), None),
+        };
+        if name.is_empty() {
+            if let Some(f) = fragment {
+                self.open_link(&format!("#{}", crate::parser::slugify(&f)));
+            }
+            return;
+        }
+        let base = match &self.source {
+            Source::File(p) => p.parent().map(Path::to_path_buf).unwrap_or_default(),
+            Source::Help => std::env::current_dir().unwrap_or_default(),
+        };
+        if let Some(target) = resolve_wiki_page(&base, name) {
+            self.navigate(Source::File(target), fragment.map(|f| crate::parser::slugify(&f)));
+        }
+    }
+
+    fn open_dialog(&mut self) {
+        let mut buf = [0u16; 1024];
+        let mut ofn = OPENFILENAMEW {
+            lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+            hwndOwner: self.hwnd,
+            lpstrFilter: w!("Markdown\0*.md;*.markdown;*.mdown;*.mkd;*.mkdn\0Text\0*.txt\0All files\0*.*\0"),
+            lpstrFile: PWSTR(buf.as_mut_ptr()),
+            nMaxFile: buf.len() as u32,
+            Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
+            ..Default::default()
+        };
+        if unsafe { GetOpenFileNameW(&mut ofn) }.as_bool() {
+            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            let path = PathBuf::from(String::from_utf16_lossy(&buf[..len]));
+            self.navigate(Source::File(path), None);
+        }
+    }
+
+    fn check_file_changed(&mut self) {
+        if let Source::File(path) = &self.source {
+            let now = file_mtime(path);
+            if now.is_some() && now != self.mtime {
+                self.load(self.source.clone(), true);
+            }
+        }
+    }
+
+    fn select_word(&mut self, x: f32, y: f32) {
+        let (dx, dy) = self.to_doc(x, y);
+        let Some(layout) = self.renderer.layout() else { return };
+        let Some(pos) = layout.hit_test(dx, dy) else { return };
+        let (start, end) = layout.word_bounds(pos);
+        self.selection = Some((start, end));
+        self.invalidate();
+    }
+
+    fn set_fx<K: PartialEq + Copy>(fx: &mut Vec<(K, Fade)>, current: Option<K>) -> bool {
+        let mut changed = false;
+        for (k, f) in fx.iter_mut() {
+            let on = Some(*k) == current;
+            changed |= f.on != on;
+            f.on = on;
+        }
+        if let Some(k) = current {
+            if !fx.iter().any(|(x, _)| *x == k) {
+                fx.push((k, Fade { value: 0.0, on: true }));
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn on_mouse_move(&mut self, x: f32, y: f32, wparam: WPARAM) {
+        let (vw, vh) = self.view_size();
+        if let Some(grab) = self.drag_thumb {
+            let Some(layout) = self.renderer.layout() else { return };
+            if let Some(thumb) = scrollbar_geometry(layout.height, self.scroll.value, vw, vh, 9.0) {
+                let thumb_h = thumb.bottom - thumb.top + 6.0;
+                let frac = ((y - grab) / (vh - thumb_h).max(1.0)).clamp(0.0, 1.0);
+                let target = frac * layout.max_scroll(vh);
+                self.jump_to(target);
+            }
+            return;
+        }
+        if self.selecting && (wparam.0 & 0x0001) != 0 {
+            if y < 0.0 {
+                self.jump_to(self.scroll.value + y);
+            } else if y > vh {
+                self.jump_to(self.scroll.value + y - vh);
+            }
+            let (dx, dy) = self.to_doc(x, y);
+            if let (Some(layout), Some((anchor, _))) = (self.renderer.layout(), self.selection) {
+                if let Some(focus) = layout.hit_test(dx, dy) {
+                    self.selection = Some((anchor, focus));
+                    self.invalidate();
+                }
+            }
+            return;
+        }
+
+        if !self.tracking_leave {
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: self.hwnd,
+                dwHoverTime: 0,
+            };
+            unsafe {
+                let _ = TrackMouseEvent(&mut tme);
+            }
+            self.tracking_leave = true;
+        }
+        if let Some(sw) = self.switcher.as_mut() {
+            let n = self.switcher_entries.len();
+            let hover = switcher_row_at(vw, n, x, y);
+            let panel = switcher_rect(vw, n);
+            let over_panel = x >= panel.left && x <= panel.right && y >= panel.top && y <= panel.bottom;
+            self.cursor = if hover.is_some() { CursorKind::Hand } else { CursorKind::Arrow };
+            if hover != sw.hover {
+                sw.hover = hover;
+                self.invalidate();
+            }
+            if over_panel {
+                return;
+            }
+        }
+        let (dx, dy) = self.to_doc(x, y);
+        let Some(layout) = self.renderer.layout() else { return };
+        let scrollbar_hot = x >= vw - SCROLLBAR_HIT_WIDTH && layout.height > vh;
+        let (row, link, code, button_hot, cursor) = if scrollbar_hot {
+            (None, None, None, false, CursorKind::Arrow)
+        } else {
+            let link = layout.link_id_at(dx, dy);
+            let code = layout.code_at(dx, dy);
+            let button_hot = code.and_then(|c| layout.code_button_rect(c)).is_some_and(|r| dx >= r.left && dx <= r.right && dy >= r.top && dy <= r.bottom);
+            let cursor = if link.is_some() || button_hot {
+                CursorKind::Hand
+            } else if layout.over_text(dx, dy) {
+                CursorKind::IBeam
+            } else {
+                CursorKind::Arrow
+            };
+            (layout.row_at(dx, dy), link, code, button_hot, cursor)
+        };
+        self.cursor = cursor;
+        let mut changed = Self::set_fx(&mut self.row_fx, row) | Self::set_fx(&mut self.link_fx, link);
+        changed |= scrollbar_hot != self.scrollbar_hot || code != self.code_hover || button_hot != self.code_button_hot;
+        self.hover_row = row;
+        self.hover_link = link;
+        self.scrollbar_hot = scrollbar_hot;
+        self.code_hover = code;
+        self.code_button_hot = button_hot;
+        if changed {
+            self.invalidate();
+        }
+    }
+
+    fn on_mouse_leave(&mut self) {
+        self.tracking_leave = false;
+        Self::set_fx(&mut self.row_fx, None);
+        Self::set_fx(&mut self.link_fx, None);
+        self.hover_row = None;
+        self.hover_link = None;
+        self.scrollbar_hot = false;
+        self.code_hover = None;
+        self.code_button_hot = false;
+        self.invalidate();
+    }
+
+    fn on_mouse_down(&mut self, x: f32, y: f32) {
+        let (vw, vh) = self.view_size();
+        if self.switcher.is_some() {
+            // Click a row to pick it; click anywhere outside to keep what is shown.
+            let n = self.switcher_entries.len();
+            let panel = switcher_rect(vw, n);
+            if let Some(row) = switcher_row_at(vw, n, x, y) {
+                self.apply_theme(row, true);
+                self.switcher = None;
+                self.invalidate();
+            } else if x < panel.left || x > panel.right || y < panel.top || y > panel.bottom {
+                self.close_switcher(true);
+            }
+            return;
+        }
+        if let (Some(code), true) = (self.code_hover, self.code_button_hot) {
+            if let Some(text) = self.renderer.layout().and_then(|l| l.code_text(code)) {
+                let _ = set_clipboard_text(self.hwnd, &text);
+                self.copied = Some((code, Instant::now()));
+                self.invalidate();
+            }
+            return;
+        }
+        unsafe {
+            SetCapture(self.hwnd);
+        }
+        let Some(layout) = self.renderer.layout() else { return };
+        if x >= vw - SCROLLBAR_HIT_WIDTH {
+            if let Some(thumb) = scrollbar_geometry(layout.height, self.scroll.value, vw, vh, 9.0) {
+                if y >= thumb.top && y <= thumb.bottom {
+                    self.drag_thumb = Some(y - thumb.top + 3.0);
+                } else {
+                    let page = vh * 0.9;
+                    self.scroll_by(if y < thumb.top { -page } else { page });
+                }
+                self.invalidate();
+                return;
+            }
+        }
+        let (dx, dy) = self.to_doc(x, y);
+        self.press_link = layout.link_at(dx, dy).map(str::to_string);
+        if let Some(pos) = layout.hit_test(dx, dy) {
+            let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+            self.selection = match (shift, self.selection) {
+                (true, Some((anchor, _))) => Some((anchor, pos)),
+                _ => Some((pos, pos)),
+            };
+            self.selecting = true;
+        }
+        self.invalidate();
+    }
+
+    fn on_mouse_up(&mut self, x: f32, y: f32) {
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        self.selecting = false;
+        if self.drag_thumb.take().is_some() {
+            self.invalidate();
+            return;
+        }
+        let collapsed = self.ordered_selection().is_none();
+        if let Some(url) = self.press_link.take() {
+            let (dx, dy) = self.to_doc(x, y);
+            let still_over = self.renderer.layout().and_then(|l| l.link_at(dx, dy)) == Some(url.as_str());
+            if collapsed && still_over {
+                self.selection = None;
+                self.open_link(&url);
+            }
+        }
+    }
+
+    /// Wheel input. `horizontal` for tilt wheels / two-finger sideways swipes.
+    fn on_wheel(&mut self, delta: f32, horizontal: bool, ctrl: bool, shift: bool, x: f32, y: f32) {
+        if ctrl && !horizontal {
+            self.zoom_to(self.zoom.target * 1.1f32.powf(delta), y);
+            return;
+        }
+        // Sideways scrolling (or Shift+wheel) over a code block scrolls that block.
+        if horizontal || shift {
+            let (dx, dy) = self.to_doc(x, y);
+            let amount = if horizontal { delta } else { -delta } * self.line_height() * 2.5;
+            if let Some(code) = self.renderer.layout().and_then(|l| l.code_at(dx, dy)) {
+                if self.renderer.layout_mut().is_some_and(|l| l.scroll_code(code, amount)) {
+                    self.invalidate();
+                }
+            }
+            return;
+        }
+        let mut lines = 3u32;
+        unsafe {
+            let _ = SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, Some(&mut lines as *mut u32 as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+        }
+        let lines = if lines == u32::MAX { 12.0 } else { lines.clamp(1, 20) as f32 };
+        // Fractional deltas from precision touchpads and smooth-scroll mice feed the spring directly.
+        self.scroll_by(-delta * lines * self.line_height());
+    }
+
+    fn on_key(&mut self, vk: VIRTUAL_KEY) -> bool {
+        let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+        let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+        if self.switcher.is_some() && !ctrl && self.switcher_key(vk, shift) {
+            return true;
+        }
+        let (_, vh) = self.view_size();
+        let line = self.line_height() * 2.0;
+        let page = (vh - self.line_height() * 2.0).max(self.line_height());
+        match vk {
+            VK_DOWN => self.scroll_by(line),
+            VK_UP => self.scroll_by(-line),
+            VK_NEXT => self.scroll_by(page),
+            VK_PRIOR => self.scroll_by(-page),
+            VK_SPACE => self.scroll_by(if shift { -page } else { page }),
+            VK_HOME => self.scroll_to(0.0),
+            VK_END => {
+                let _ = self.renderer.finish_layout(&self.doc);
+                self.scroll_to(f32::MAX);
+            }
+            VK_F1 => self.navigate(Source::Help, None),
+            VK_F5 => self.reload(),
+            VK_BACK => self.back(),
+            VK_ESCAPE => {
+                self.selection = None;
+                self.invalidate();
+            }
+            VK_OEM_PLUS | VK_ADD if ctrl => self.zoom_to(self.zoom.target * 1.1, vh / 2.0),
+            VK_OEM_MINUS | VK_SUBTRACT if ctrl => self.zoom_to(self.zoom.target / 1.1, vh / 2.0),
+            VK_0 | VK_NUMPAD0 if ctrl => self.zoom_to(1.0, vh / 2.0),
+            VK_C if ctrl => self.copy_selection(),
+            VK_A if ctrl => {
+                let _ = self.renderer.finish_layout(&self.doc);
+                self.selection = self.renderer.layout().and_then(|l| l.select_all());
+                self.invalidate();
+            }
+            VK_O if ctrl => self.open_dialog(),
+            VK_W if ctrl => unsafe {
+                let _ = DestroyWindow(self.hwnd);
+            },
+            VK_T if ctrl => self.toggle_switcher(),
+            VK_T => self.apply_theme(self.themes.neighbor(!shift), true),
+            _ => return false,
+        }
+        true
+    }
+}
+
+unsafe fn app_from(hwnd: HWND) -> Option<&'static mut App> {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+    ptr.as_mut()
+}
+
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let Some(app) = app_from(hwnd) else {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    };
+    match msg {
+        WM_PAINT => {
+            // Also reached from modal loops (live resize), where the frame loop isn't running.
+            app.frame();
+            let _ = ValidateRect(hwnd, None);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1), // Prevent Win32 flicker, Direct2D paints full surface
+        WM_SIZE => {
+            app.renderer.resize();
+            app.invalidate();
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            let dpi = (wparam.0 & 0xffff) as u32;
+            app.dpi = dpi;
+            app.renderer.set_dpi(dpi);
+            let r = *(lparam.0 as *const RECT);
+            let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            let delta = ((wparam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
+            let keys = wparam.0 & 0xffff;
+            // Wheel messages carry screen coordinates.
+            let mut p = POINT { x: (lparam.0 & 0xffff) as i16 as i32, y: ((lparam.0 >> 16) & 0xffff) as i16 as i32 };
+            let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut p);
+            let s = 96.0 / app.dpi as f32;
+            app.on_wheel(delta, msg == WM_MOUSEHWHEEL, keys & 0x0008 != 0, keys & 0x0004 != 0, p.x as f32 * s, p.y as f32 * s);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            let (x, y) = app.point(lparam);
+            app.on_mouse_move(x, y, wparam);
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            app.on_mouse_leave();
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            let (x, y) = app.point(lparam);
+            app.on_mouse_down(x, y);
+            LRESULT(0)
+        }
+        WM_LBUTTONDBLCLK => {
+            let (x, y) = app.point(lparam);
+            app.select_word(x, y);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let (x, y) = app.point(lparam);
+            app.on_mouse_up(x, y);
+            LRESULT(0)
+        }
+        WM_XBUTTONUP => {
+            if ((wparam.0 >> 16) & 0xffff) as u16 == 1 {
+                app.back();
+            }
+            LRESULT(1)
+        }
+        WM_SETCURSOR if (lparam.0 & 0xffff) as u32 == HTCLIENT => {
+            let id = match app.cursor {
+                CursorKind::Arrow => IDC_ARROW,
+                CursorKind::Hand => IDC_HAND,
+                CursorKind::IBeam => IDC_IBEAM,
+            };
+            if let Ok(cursor) = LoadCursorW(None, id) {
+                SetCursor(cursor);
+            }
+            LRESULT(1)
+        }
+        WM_KEYDOWN => {
+            if app.on_key(VIRTUAL_KEY(wparam.0 as u16)) {
+                LRESULT(0)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
+        WM_SYSKEYDOWN if VIRTUAL_KEY(wparam.0 as u16) == VK_LEFT => {
+            app.back();
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            if wparam.0 == TIMER_WATCH {
+                app.check_file_changed();
+            }
+            LRESULT(0)
+        }
+        WM_DROPFILES => {
+            let hdrop = HDROP(wparam.0 as *mut _);
+            let mut buf = [0u16; 1024];
+            let len = DragQueryFileW(hdrop, 0, Some(&mut buf)) as usize;
+            DragFinish(hdrop);
+            if len > 0 {
+                let path = PathBuf::from(String::from_utf16_lossy(&buf[..len]));
+                app.navigate(Source::File(path), None);
+            }
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            drop(Box::from_raw(app as *mut App));
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// The pixel-hinted 16px (or DPI-appropriate) frame for the title bar, instead of a downscaled 32px one.
+fn load_small_icon(instance: HINSTANCE) -> HICON {
+    unsafe {
+        let cx = GetSystemMetrics(SM_CXSMICON);
+        let cy = GetSystemMetrics(SM_CYSMICON);
+        LoadImageW(instance, APP_ICON, IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR)
+            .map(|h| HICON(h.0))
+            .unwrap_or_default()
+    }
+}
+
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// First existing markdown file for a wiki page name in `base`.
+fn resolve_wiki_page(base: &Path, name: &str) -> Option<PathBuf> {
+    [format!("{name}.md"), format!("{name}.markdown"), name.to_string()]
+        .into_iter()
+        .map(|candidate| base.join(candidate))
+        .find(|p| p.is_file() && is_markdown(p))
+}
+
+fn is_markdown(path: &Path) -> bool {
+    path.extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|e| matches!(e.as_str(), "md" | "markdown" | "mdown" | "mkd" | "mkdn"))
+}
+
+/// `https:`, `mailto:` etc. A single letter followed by ':' is a drive letter, not a scheme.
+fn has_scheme(url: &str) -> bool {
+    match url.split_once(':') {
+        Some((scheme, _)) => scheme.len() > 1 && scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.'),
+        None => false,
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn shell_open(hwnd: HWND, target: &str) {
+    let target = wide(target);
+    unsafe {
+        ShellExecuteW(hwnd, w!("open"), PCWSTR(target.as_ptr()), None, None, SW_SHOWNORMAL);
+    }
+}
+
+fn set_clipboard_text(hwnd: HWND, text: &str) -> Result<()> {
+    let data: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        OpenClipboard(hwnd)?;
+        let result = (|| {
+            EmptyClipboard()?;
+            let mem = GlobalAlloc(GMEM_MOVEABLE, data.len() * 2)?;
+            let ptr = GlobalLock(mem) as *mut u16;
+            if ptr.is_null() {
+                return Err(Error::from_win32());
+            }
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            let _ = GlobalUnlock(mem);
+            // CF_UNICODETEXT; the clipboard takes ownership of `mem`.
+            SetClipboardData(13, HANDLE(mem.0))?;
+            Ok(())
+        })();
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_classification() {
+        assert!(has_scheme("https://example.com"));
+        assert!(has_scheme("mailto:a@b.c"));
+        assert!(!has_scheme("C:\\docs\\a.md"));
+        assert!(!has_scheme("docs/a.md"));
+        assert_eq!(percent_decode("my%20file.md"), "my file.md");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert!(is_markdown(Path::new("x/Y.MD")));
+    }
+
+    #[test]
+    fn wiki_pages_resolve_next_to_the_document() {
+        let dir = std::env::temp_dir().join(format!("wackdown-wiki-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Project Notes.md"), "# Notes").unwrap();
+        std::fs::write(dir.join("Other.markdown"), "# Other").unwrap();
+        std::fs::write(dir.join("image.png"), "png").unwrap();
+        assert_eq!(resolve_wiki_page(&dir, "Project Notes"), Some(dir.join("Project Notes.md")));
+        assert_eq!(resolve_wiki_page(&dir, "Other"), Some(dir.join("Other.markdown")));
+        assert_eq!(resolve_wiki_page(&dir, "Project Notes.md"), Some(dir.join("Project Notes.md")));
+        assert_eq!(resolve_wiki_page(&dir, "image.png"), None, "only markdown files open in the viewer");
+        assert_eq!(resolve_wiki_page(&dir, "Missing"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

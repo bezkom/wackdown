@@ -1,0 +1,25 @@
+Windows Registry Editor Version 5.00
+
+; Register WackDown as the handler for .md and .markdown (current user, no admin needed).
+; Expects the binary at C:\Program Files\WackDown\wackdown.exe - edit the two paths below if you put it elsewhere.
+
+[HKEY_CURRENT_USER\Software\Classes\.md]
+@="WackDown.Document"
+
+[HKEY_CURRENT_USER\Software\Classes\.md\OpenWithProgids]
+"WackDown.Document"=""
+
+[HKEY_CURRENT_USER\Software\Classes\.markdown]
+@="WackDown.Document"
+
+[HKEY_CURRENT_USER\Software\Classes\.markdown\OpenWithProgids]
+"WackDown.Document"=""
+
+[HKEY_CURRENT_USER\Software\Classes\WackDown.Document]
+@="Markdown Document"
+
+[HKEY_CURRENT_USER\Software\Classes\WackDown.Document\DefaultIcon]
+@="\"C:\\Program Files\\WackDown\\wackdown.exe\",1"
+
+[HKEY_CURRENT_USER\Software\Classes\WackDown.Document\shell\open\command]
+@="\"C:\\Program Files\\WackDown\\wackdown.exe\" \"%1\""

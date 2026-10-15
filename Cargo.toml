@@ -1,0 +1,55 @@
+[package]
+name = "wackdown"
+version = "1.0.0"
+edition = "2021"
+authors = ["WackDown Core"]
+description = "Blazing fast native Windows x64 Direct2D Markdown viewer"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/bezkom/wackdown"
+
+[target.'cfg(windows)'.dependencies]
+# Direct Win32 / Direct2D / DirectWrite bindings (zero CRT bloat)
+windows = { version = "0.58", features = [
+    "Foundation_Numerics",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+] }
+
+# Zero-copy memory mapped file reading for instant document launch
+memmap2 = "0.9"
+
+# Fast, lightweight markdown parser
+pulldown-cmark = { version = "0.13", default-features = false }
+
+# Theme JSON deserializer
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[build-dependencies]
+# Compiles wackdown.rc (icons + version info) into the binary
+embed-resource = "3.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

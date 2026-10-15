@@ -1,0 +1,62 @@
+name: Release
+
+# Push a tag matching the Cargo.toml version to publish a release:
+#   git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if ("v$version" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match Cargo.toml version $version" }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --target x86_64-pc-windows-msvc
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build exe and installer
+        shell: pwsh
+        run: ./installer/build.ps1
+
+      # Code signing goes here, before the files are packaged: sign
+      # target/x86_64-pc-windows-msvc/release/wackdown.exe, then the installer.
+
+      - name: Package portable exe and checksums
+        shell: pwsh
+        run: |
+          Copy-Item target/x86_64-pc-windows-msvc/release/wackdown.exe "dist/wackdown-$env:VERSION-x64-portable.exe"
+          Get-ChildItem dist/*.exe | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower(), $_.Name } |
+            Set-Content -Encoding ascii dist/SHA256SUMS.txt
+          Get-Content dist/SHA256SUMS.txt
+
+      - name: Publish the GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = @"
+          **Download** ``wackdown-setup-$env:VERSION.exe`` (installer, no admin needed) or the portable ``wackdown-$env:VERSION-x64-portable.exe``. Windows 10/11 x64.
+
+          The files are not code-signed yet, so Windows SmartScreen may warn: choose **More info → Run anyway**. Verify downloads against ``SHA256SUMS.txt``.
+          "@
+          gh release create "${{ github.ref_name }}" `
+            "dist/wackdown-setup-$env:VERSION.exe" `
+            "dist/wackdown-$env:VERSION-x64-portable.exe" `
+            dist/SHA256SUMS.txt `
+            --title "ƜackDown $env:VERSION" --notes $notes --generate-notes

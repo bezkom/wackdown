@@ -1,0 +1,24 @@
+# Rust build output (includes target/resilience-failures/ from the fuzz tests)
+/target/
+**/*.rs.bk
+
+# Installer output (build with installer/build.ps1; attach to GitHub releases instead)
+/dist/
+
+# Python bytecode from assets/icon/make_icon.py, assets/fonts/subset_fonts.py, tests/fixtures/fetch_fixtures.py
+__pycache__/
+*.pyc
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local AI-assistant settings
+.claude/settings.local.json
+
+# OS clutter
+Thumbs.db
+Desktop.ini
+.DS_Store
