@@ -172,6 +172,8 @@ impl Layout {
             // its padding: a resize while scrolled to the top must stay at the top.
             Some(_) if i == 0 && frac <= 0.0 => 0.0,
             Some(s) => s.gtop + (s.bottom - s.gtop) * frac,
+            // Past the last block: the end of the document (or its top, if it has no blocks).
+            None if self.spans.is_empty() => 0.0,
             None => self.height,
         }
     }
