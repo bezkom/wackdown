@@ -115,7 +115,8 @@ section { padding: 72px 20px; }
 /* Keys */
 .keys { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px 32px; }
 .keys div { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px dashed var(--line); }
-.keys span:last-child { white-space: nowrap; }
+.keys span:first-child { flex: 1; }
+.keys span:last-child { text-align: right; }
 
 /* FAQ */
 details { border-bottom: 1px solid var(--line); padding: 14px 0; }
