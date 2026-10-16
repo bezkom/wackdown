@@ -153,11 +153,16 @@ impl Layout {
 
     /// View point to document point for a multi-column view: which column slice it is in.
     pub fn view_to_doc(&self, x: f32, y: f32, scroll: f32, view_h: f32) -> (f32, f32) {
-        if self.columns <= 1 || self.column_w <= 0.0 {
-            return (x, y + scroll);
-        }
-        let col = ((x / self.column_w).floor().max(0.0) as usize).min(self.columns - 1);
+        let col = self.column_at(x);
         (x - col as f32 * self.column_w, y + scroll + col as f32 * view_h)
+    }
+
+    /// Which column (0-based) view x falls in; 0 for a single-column layout.
+    pub fn column_at(&self, x: f32) -> usize {
+        if self.columns <= 1 || self.column_w <= 0.0 {
+            return 0;
+        }
+        ((x / self.column_w).floor().max(0.0) as usize).min(self.columns - 1)
     }
 
     /// Blocks laid out so far.

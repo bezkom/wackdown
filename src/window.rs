@@ -68,8 +68,8 @@ struct Zoom {
     committed: f32,
     visual: f32,
     target: f32,
-    /// View y the zoom is centered on (the mouse, or the middle of the window).
-    anchor_y: f32,
+    /// View point the zoom is centered on (the mouse, or the middle of the window).
+    anchor: (f32, f32),
     last_input: Instant,
 }
 
@@ -90,8 +90,9 @@ struct App {
     pending_fragment: Option<String>,
     scroll: Spring,
     zoom: Zoom,
-    /// Block anchor to restore after a zoom relayout: (block, frac, view y).
-    zoom_anchor: Option<((usize, f32), f32)>,
+    /// Block anchor to restore after a zoom relayout: the block under the zoom anchor, the view y
+    /// it was at, and the column it was in.
+    zoom_anchor: Option<((usize, f32), f32, usize)>,
     /// Fades in the message that greets anyone who reaches either end of the zoom range.
     zoom_note: Fade,
     /// Scroll position of the last drawn frame, for motion blur; and whether blur is enabled.
@@ -209,7 +210,7 @@ pub fn run_window_loop(file: Option<PathBuf>, startup_timer: Instant) -> Result<
             forward: Vec::new(),
             pending_fragment: None,
             scroll: Spring::new(0.0, SCROLL_OMEGA),
-            zoom: Zoom { committed: saved_zoom, visual: saved_zoom, target: saved_zoom, anchor_y: 0.0, last_input: now },
+            zoom: Zoom { committed: saved_zoom, visual: saved_zoom, target: saved_zoom, anchor: (0.0, 0.0), last_input: now },
             zoom_anchor: None,
             zoom_note: Fade::default(),
             last_drawn_scroll: 0.0,
@@ -302,7 +303,7 @@ impl App {
     /// Current visual zoom transform: (scale, center x, center y), if not identity.
     fn zoom_transform(&self) -> Option<(f32, f32, f32)> {
         let s = self.zoom.visual / self.zoom.committed;
-        ((s - 1.0).abs() > 0.0005).then(|| (s, self.view_size().0 / 2.0, self.zoom.anchor_y))
+        ((s - 1.0).abs() > 0.0005).then(|| (s, self.zoom.anchor.0, self.zoom.anchor.1))
     }
 
     /// View point to document coordinates, undoing an in-flight zoom transform and mapping
@@ -677,7 +678,7 @@ impl App {
         let (_, vh) = self.view_size();
         let visible = self.visible_height();
         let prior_anchor = self.renderer.layout().map(|l| l.block_at(self.scroll.value));
-        let need_block = self.zoom_anchor.map(|(a, _)| a.0).or(prior_anchor.map(|a| a.0)).unwrap_or(0);
+        let need_block = self.zoom_anchor.map(|(a, _, _)| a.0).or(prior_anchor.map(|a| a.0)).unwrap_or(0);
         let scale = self.zoom_transform().map_or(1.0, |(s, _, _)| s);
         let need_y = self.scroll.value.max(self.scroll.target) + visible * 1.5 / scale.min(1.0);
         // A relayout that changes the zoom or the column count gets a crossfade from the old
@@ -697,8 +698,13 @@ impl App {
             .ensure_layout(&self.doc, theme, &self.palette, self.doc_gen, self.theme_gen, self.zoom.committed, need_y, need_block, LAYOUT_BUDGET)
             .unwrap_or(false);
         if fresh && self.laid_doc_gen == self.doc_gen {
-            if let Some((anchor, view_y)) = self.zoom_anchor.take() {
-                let y = self.renderer.layout().map_or(0.0, |l| l.block_y(anchor)) - view_y;
+            if let Some((anchor, view_y, col)) = self.zoom_anchor.take() {
+                // Put the block back under the zoom anchor, in the same column if there still
+                // is one. The scroll position is where column 0 starts, so an anchor in column
+                // `col` sits `col` view heights further down the document.
+                let layout = self.renderer.layout();
+                let col = col.min(layout.map_or(1, |l| l.columns.max(1)) - 1);
+                let y = layout.map_or(0.0, |l| l.block_y(anchor)) - view_y - col as f32 * vh;
                 self.scroll.set(y);
                 // Extreme zoom can land the view on empty space (padding, the gap between giant
                 // lines): make sure some text is on screen.
@@ -755,10 +761,13 @@ impl App {
             z.visual = z.target;
         }
         if z.visual == z.target && z.committed != z.target && now.duration_since(z.last_input) >= ZOOM_SETTLE {
-            let view_y = z.anchor_y;
-            let doc_y = self.scroll.value + view_y;
+            // The anchor is the fixed point of the gesture, so what's under it now is what was
+            // under it in the committed layout: remember that block, and which column it's in.
+            let (ax, ay) = z.anchor;
+            let (_, vh) = self.view_size();
             if let Some(layout) = self.renderer.layout() {
-                self.zoom_anchor = Some((layout.block_at(doc_y), view_y));
+                let (_, doc_y) = layout.view_to_doc(ax, ay, self.scroll.value, vh);
+                self.zoom_anchor = Some((layout.block_at(doc_y), ay, layout.column_at(ax)));
             }
             self.zoom.committed = self.zoom.target;
             let zoom = self.zoom.target;
@@ -913,20 +922,22 @@ impl App {
         self.invalidate();
     }
 
-    /// Starts or retargets a zoom gesture centered on view y `anchor_y`.
-    /// One zoom step in or out. Steps grow at the extremes so reaching orbit doesn't take all day.
-    fn zoom_step(&mut self, notches: f32, anchor_y: f32) {
+    /// One zoom step in or out, centered on the view point `anchor` (the mouse for the wheel,
+    /// the middle of the window for the keyboard). Steps grow at the extremes so reaching orbit
+    /// doesn't take all day.
+    fn zoom_step(&mut self, notches: f32, anchor: (f32, f32)) {
         let z = self.zoom.target;
         let factor: f32 = if !(0.5..=2.0).contains(&z) { 1.25 } else { 1.1 };
-        self.zoom_to(z * factor.powf(notches), anchor_y);
+        self.zoom_to(z * factor.powf(notches), anchor);
     }
 
-    fn zoom_to(&mut self, zoom: f32, anchor_y: f32) {
+    /// Starts or retargets a zoom gesture centered on the view point `anchor`.
+    fn zoom_to(&mut self, zoom: f32, anchor: (f32, f32)) {
         // Three decimals: fine enough for the small end, and keeps 1.0 exactly reachable.
         let z = (zoom.clamp(MIN_ZOOM, MAX_ZOOM) * 1000.0).round() / 1000.0;
         if self.zoom.visual == self.zoom.committed {
             // New gesture: pin it to where it started.
-            self.zoom.anchor_y = anchor_y;
+            self.zoom.anchor = anchor;
         }
         self.zoom.target = z;
         self.zoom.last_input = Instant::now();
@@ -1232,7 +1243,7 @@ impl App {
     /// Wheel input. `horizontal` for tilt wheels / two-finger sideways swipes.
     fn on_wheel(&mut self, delta: f32, horizontal: bool, ctrl: bool, shift: bool, x: f32, y: f32) {
         if ctrl && !horizontal {
-            self.zoom_step(delta, y);
+            self.zoom_step(delta, (x, y));
             return;
         }
         // Sideways scrolling (or Shift+wheel) over a code block scrolls that block.
@@ -1281,7 +1292,7 @@ impl App {
                 _ => {}
             }
         }
-        let (_, vh) = self.view_size();
+        let (vw, vh) = self.view_size();
         let line = self.line_height() * 2.0;
         let page = (self.visible_height() - self.line_height() * 2.0).max(self.line_height());
         match vk {
@@ -1315,9 +1326,9 @@ impl App {
                 self.selection = None;
                 self.invalidate();
             }
-            VK_OEM_PLUS | VK_ADD if ctrl => self.zoom_step(1.0, vh / 2.0),
-            VK_OEM_MINUS | VK_SUBTRACT if ctrl => self.zoom_step(-1.0, vh / 2.0),
-            VK_0 | VK_NUMPAD0 if ctrl => self.zoom_to(1.0, vh / 2.0),
+            VK_OEM_PLUS | VK_ADD if ctrl => self.zoom_step(1.0, (vw / 2.0, vh / 2.0)),
+            VK_OEM_MINUS | VK_SUBTRACT if ctrl => self.zoom_step(-1.0, (vw / 2.0, vh / 2.0)),
+            VK_0 | VK_NUMPAD0 if ctrl => self.zoom_to(1.0, (vw / 2.0, vh / 2.0)),
             VK_C if ctrl => self.copy_selection(),
             VK_A if ctrl => {
                 let _ = self.renderer.finish_layout(&self.doc);
