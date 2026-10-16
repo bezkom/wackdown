@@ -117,6 +117,15 @@ Not supported: Mermaid diagrams render as code blocks.
 
 Launched without a file argument, ƜackDown opens `README.md` from the current folder, or the built-in help.
 
+## Reading view
+- **Columns.** When the window is wider than two reading columns (a wide monitor, or zoomed out), the
+  view splits into side-by-side columns: text flows down one and continues at the top of the next,
+  and all columns scroll together. The column width follows the theme's `measure`, so nothing is ever
+  laid out wider than the window; at extreme zoom a line simply holds fewer letters.
+- **Motion.** Fast scrolling is motion-blurred, and a zoom or column change crossfades from the
+  previous frame instead of snapping. Both are cheap bitmap composites of the already-drawn page.
+  Turn the blur off with `"motionBlur": false` in `%APPDATA%\WackDown\config.json`.
+
 ## Custom Themes
 The six built-in themes live in `themes/` and are compiled into the binary. To add your own, drop a
 `*.json` file into `%APPDATA%\WackDown\themes` (copy a built-in theme as a starting point).

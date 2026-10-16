@@ -317,6 +317,7 @@ impl Harness {
                 find: Some(FindView { query: if i == 0 { String::new() } else { "e".into() }, count: matches.len(), current: 0 }),
                 status: Some(format!("https://example.com/{}", "very-long-path/".repeat(i * 20))),
                 zoom_note: (i > 0).then_some((i == 1, 0.5 * i as f32)),
+                blur: [0.0, 18.0, -45.0][i],
                 scrollbar: ScrollbarView { width: 4.0 + 4.0 * i as f32, alpha: 1.0, track: (i == 1) as u8 as f32 },
                 zoom: (i == 1).then_some((1.35, vw / 2.0, vh / 3.0)),
                 flash,
@@ -359,6 +360,8 @@ fn spec_corpus_parses_into_valid_structures() {
 fn spec_corpus_lays_out_and_renders_in_every_theme() {
     let mut wide = Harness::new(900, 700);
     let mut narrow = Harness::new(160, 240);
+    // Wide enough for several columns at 50% zoom.
+    let mut panorama = Harness::new(2600, 500);
     for (i, (label, md)) in corpus().into_iter().enumerate() {
         let doc = parse_markdown(&md);
         let zoom = match i % 9 {
@@ -372,6 +375,11 @@ fn spec_corpus_lays_out_and_renders_in_every_theme() {
             wide.exercise(&doc, i, zoom, &label);
             if i % 3 == 0 {
                 narrow.exercise(&doc, i + 1, zoom, &format!("{label} [narrow]"));
+            }
+            if i % 5 == 0 {
+                panorama.exercise(&doc, i + 2, 0.5, &format!("{label} [panorama]"));
+                let columns = panorama.renderer.layout().map_or(0, |l| l.columns);
+                assert!(columns >= 2, "{label}: expected a multi-column view in a 2600px window at 50%, got {columns}");
             }
         });
     }
@@ -499,6 +507,28 @@ fn huge_document_lays_out_only_the_first_screen_up_front() {
     let layout = h.renderer.layout().unwrap();
     assert!(layout.complete && layout.laid_blocks() == doc.blocks.len());
     eprintln!("40k blocks: device {device:?}, first screen {first_screen:?}, full layout {full:?}");
+}
+
+/// Writes real rendered frames to target/snapshots/*.bmp for a human to look at: the help page
+/// in a wide window at 50% (multi-column), the same mid-scroll (motion blur), and at 100%.
+#[test]
+fn snapshots_render_offscreen() {
+    let doc = parse_markdown(include_str!("help.md"));
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("snapshots");
+    let mut h = Harness::new(1900, 820);
+    let theme = &h.themes[0];
+    let pal = theme.palette();
+    h.renderer.ensure_layout(&doc, theme, &pal, 1, 1, 0.5, f32::MAX, usize::MAX, Duration::from_secs(30)).unwrap();
+    h.renderer.finish_layout(&doc).unwrap();
+    let columns = h.renderer.layout().unwrap().columns;
+    assert!(columns >= 2, "expected columns in a 1900px window at 50%, got {columns}");
+    h.renderer.snapshot_bmp(&pal, &ViewState { scroll: 0.0, ..Default::default() }, &dir.join("columns.bmp")).unwrap();
+    h.renderer.snapshot_bmp(&pal, &ViewState { scroll: 300.0, blur: 28.0, ..Default::default() }, &dir.join("blur.bmp")).unwrap();
+    h.renderer.ensure_layout(&doc, theme, &pal, 1, 2, 1.0, f32::MAX, usize::MAX, Duration::from_secs(30)).unwrap();
+    h.renderer.finish_layout(&doc).unwrap();
+    assert_eq!(h.renderer.layout().unwrap().columns, 1, "one column at 100% in 1900px");
+    h.renderer.snapshot_bmp(&pal, &ViewState { scroll: 0.0, ..Default::default() }, &dir.join("single.bmp")).unwrap();
+    eprintln!("snapshots written to {}", dir.display());
 }
 
 #[test]

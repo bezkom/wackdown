@@ -24,6 +24,10 @@ A native Direct2D Markdown viewer. Drop a `.md` file onto this window, press **C
 | Help | `F1` |
 | Close | `Ctrl+W` |
 
+## Reading view
+
+Wide window, or zoomed out? The page splits into side-by-side columns that scroll together; text flows down one column and continues at the top of the next. Fast scrolling is motion-blurred (`"motionBlur": false` in `config.json` turns that off), and zoom changes crossfade instead of snapping.
+
 ## Themes {#themes-section}
 
 Six themes are built in: Cyberpunk Terminal, Tokyo Dusk, Monokai Pro Rust, Nordic Fjord, Solarized Deep Dark and Paper Gutenberg. Your choice is remembered in `%APPDATA%\WackDown\config.json`.

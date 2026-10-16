@@ -66,6 +66,19 @@ pub struct ViewState<'a> {
     pub status: Option<String>,
     /// Message at an end of the zoom range: (zoomed all the way out?, alpha).
     pub zoom_note: Option<(bool, f32)>,
+    /// Vertical motion since the last frame, in DIPs; the document is motion-blurred by this much.
+    pub blur: f32,
+}
+
+/// Never more columns than this, however wide the window or small the zoom.
+const MAX_COLUMNS: usize = 8;
+
+/// How many columns of `ideal` width fit in `avail`.
+fn columns_for(avail: f32, ideal: f32) -> usize {
+    if !(ideal > 0.0) || !avail.is_finite() {
+        return 1;
+    }
+    ((avail / ideal).floor() as usize).clamp(1, MAX_COLUMNS)
 }
 
 /// The Ctrl+F bar.
@@ -105,6 +118,8 @@ pub struct Renderer {
     layout_key: Option<LayoutKey>,
     /// Previous frame and when the crossfade from it started.
     fade: Option<(ID2D1Bitmap, Instant)>,
+    /// Offscreen copy of the document, used to composite motion blur; recreated on resize.
+    scene: Option<(ID2D1BitmapRenderTarget, (f32, f32))>,
     ui: Option<UiFormats>,
     /// Wait for vertical blank when presenting (off in tests).
     vsync: bool,
@@ -143,6 +158,7 @@ impl Renderer {
                 builder: None,
                 layout_key: None,
                 fade: None,
+                scene: None,
                 ui: None,
                 vsync: !cfg!(test),
                 last_draw_ms: 0.0,
@@ -187,6 +203,29 @@ impl Renderer {
         self.builder = None;
         self.layout_key = None;
         self.fade = None;
+        self.scene = None;
+    }
+
+    /// Zoom the current layout was built for.
+    pub fn layout_zoom(&self) -> Option<f32> {
+        self.layout_key.map(|k| k.zoom)
+    }
+
+    fn faces(&self, theme: &WackDownTheme) -> Faces {
+        let t = &theme.typography;
+        Faces {
+            body: self.fonts.resolve(&t.font_family),
+            heading: self.fonts.resolve(t.heading_family()),
+            code: self.fonts.resolve(t.code_family()),
+            math: self.fonts.resolve("serif"),
+        }
+    }
+
+    /// How many columns the view would split into at this zoom (for deciding on a crossfade).
+    pub fn predict_columns(&self, theme: &WackDownTheme, zoom: f32) -> usize {
+        let (vw, _) = self.view_size();
+        let avail = (vw - SCROLLBAR_HIT_WIDTH).max(1.0);
+        LayoutBuilder::ideal_slot_width(&self.dwrite, theme, &self.faces(theme), zoom).map_or(1, |ideal| columns_for(avail, ideal))
     }
 
     pub fn layout(&self) -> Option<&Layout> {
@@ -225,14 +264,15 @@ impl Renderer {
             if self.layout_key.is_some_and(|k| k.theme != theme_gen) {
                 self.brushes.clear();
             }
-            let t = &theme.typography;
-            let faces = Faces {
-                body: self.fonts.resolve(&t.font_family),
-                heading: self.fonts.resolve(t.heading_family()),
-                code: self.fonts.resolve(t.code_family()),
-                math: self.fonts.resolve("serif"),
-            };
-            let (builder, layout) = LayoutBuilder::new(&self.dwrite, &dc, theme, pal, faces, zoom, width, doc)?;
+            let faces = self.faces(theme);
+            // Split the view into as many columns as the ideal column width fits.
+            let avail = (width - SCROLLBAR_HIT_WIDTH).max(1.0);
+            let ideal = LayoutBuilder::ideal_slot_width(&self.dwrite, theme, &faces, zoom)?;
+            let columns = columns_for(avail, ideal);
+            let slot = avail / columns as f32;
+            let (builder, mut layout) = LayoutBuilder::new(&self.dwrite, &dc, theme, pal, faces, zoom, slot, doc)?;
+            layout.columns = columns;
+            layout.column_w = slot;
             self.builder = Some(builder);
             self.layout = Some(layout);
             self.layout_key = Some(key);
@@ -268,21 +308,7 @@ impl Renderer {
         let target: ID2D1RenderTarget = dc.cast()?;
         unsafe {
             dc.BeginDraw();
-            self.draw_document(&target, pal, view, vw, vh)?;
-            self.draw_fade(&target, vw, vh);
-            draw_scrollbar(&target, &mut self.brushes, self.layout.as_ref(), pal, view, vw, vh)?;
-            if let Some(switcher) = &view.switcher {
-                draw_switcher(&target, &mut self.brushes, &self.dwrite, &ui, pal, switcher, vw)?;
-            }
-            if let Some(find) = &view.find {
-                draw_find(&target, &mut self.brushes, &self.dwrite, &ui, pal, find, vw)?;
-            }
-            if let Some(status) = &view.status {
-                draw_status(&target, &mut self.brushes, &self.dwrite, &ui, pal, status, vw, vh)?;
-            }
-            if let Some((far_out, alpha)) = view.zoom_note {
-                draw_zoom_note(&target, &mut self.brushes, &self.dwrite, &ui, pal, far_out, alpha, vw, vh)?;
-            }
+            self.compose(&dc, &target, &ui, pal, view, vw, vh)?;
             self.last_draw_ms = started.elapsed().as_secs_f32() * 1000.0;
             let ended = dc.EndDraw(None, None);
             if matches!(&ended, Err(e) if e.code() == D2DERR_RECREATE_TARGET) {
@@ -296,6 +322,117 @@ impl Renderer {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// Draws one complete frame (document with motion blur, crossfade, scrollbar, overlays) into
+    /// `target`, which must be `dc` itself or a target compatible with it.
+    #[allow(clippy::too_many_arguments)]
+    fn compose(&mut self, dc: &ID2D1DeviceContext, target: &ID2D1RenderTarget, ui: &UiFormats, pal: &Palette, view: &ViewState, vw: f32, vh: f32) -> Result<()> {
+        unsafe {
+            let blur = view.blur.abs().min(80.0);
+            if blur >= 2.0 {
+                // Motion blur: render the document offscreen once, then composite it several
+                // times along the motion vector with averaging opacities (1, 1/2, 1/3, ...).
+                let scene = self.scene_target(dc, vw, vh)?;
+                let scene_rt: ID2D1RenderTarget = scene.cast()?;
+                scene.BeginDraw();
+                self.draw_document(&scene_rt, pal, view, vw, vh)?;
+                scene.EndDraw(None, None)?;
+                let bitmap = scene.GetBitmap()?;
+                target.Clear(Some(&color_f(pal.background)));
+                let taps = ((blur / 2.5).ceil() as usize).clamp(2, 12);
+                let dir = view.blur.signum();
+                for k in 0..taps {
+                    // Centered on the current position so text doesn't appear displaced.
+                    let offset = dir * (blur * k as f32 / (taps - 1) as f32 - blur / 2.0);
+                    let dest = D2D_RECT_F { left: 0.0, top: offset, right: vw, bottom: vh + offset };
+                    target.DrawBitmap(&bitmap, Some(&dest), 1.0 / (k as f32 + 1.0), D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                }
+            } else {
+                self.draw_document(target, pal, view, vw, vh)?;
+            }
+            self.draw_fade(target, vw, vh);
+            draw_scrollbar(target, &mut self.brushes, self.layout.as_ref(), pal, view, vw, vh)?;
+            if let Some(switcher) = &view.switcher {
+                draw_switcher(target, &mut self.brushes, &self.dwrite, ui, pal, switcher, vw)?;
+            }
+            if let Some(find) = &view.find {
+                draw_find(target, &mut self.brushes, &self.dwrite, ui, pal, find, vw)?;
+            }
+            if let Some(status) = &view.status {
+                draw_status(target, &mut self.brushes, &self.dwrite, ui, pal, status, vw, vh)?;
+            }
+            if let Some((far_out, alpha)) = view.zoom_note {
+                draw_zoom_note(target, &mut self.brushes, &self.dwrite, ui, pal, far_out, alpha, vw, vh)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Renders a complete frame offscreen and writes it as a 32-bit BMP, so tests can look at
+    /// the actual picture without a visible window (the screen can't be captured while the
+    /// workstation is locked, for instance).
+    #[cfg(test)]
+    pub fn snapshot_bmp(&mut self, pal: &Palette, view: &ViewState, path: &std::path::Path) -> Result<()> {
+        let dc = self.ensure_gpu()?;
+        let (vw, vh) = self.view_size();
+        let ui = self.ui_formats()?;
+        unsafe {
+            let frame = dc.CreateCompatibleRenderTarget(Some(&D2D_SIZE_F { width: vw, height: vh }), None, None, D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE)?;
+            let target: ID2D1RenderTarget = frame.cast()?;
+            frame.BeginDraw();
+            self.compose(&dc, &target, &ui, pal, view, vw, vh)?;
+            frame.EndDraw(None, None)?;
+            let gpu_bitmap = frame.GetBitmap()?;
+            let size = gpu_bitmap.GetPixelSize();
+            let props = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: gpu_bitmap.GetPixelFormat(),
+                dpiX: self.dpi,
+                dpiY: self.dpi,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                ..Default::default()
+            };
+            let cpu = dc.CreateBitmap(size, None, 0, &props)?;
+            cpu.CopyFromBitmap(None, &gpu_bitmap, None)?;
+            let mapped = cpu.Map(D2D1_MAP_OPTIONS_READ)?;
+            let (w, h) = (size.width as usize, size.height as usize);
+            let mut out = Vec::with_capacity(54 + w * h * 4);
+            // BITMAPFILEHEADER + BITMAPINFOHEADER, 32 bpp BGRA, bottom-up.
+            out.extend_from_slice(b"BM");
+            out.extend_from_slice(&((54 + w * h * 4) as u32).to_le_bytes());
+            out.extend_from_slice(&[0, 0, 0, 0]);
+            out.extend_from_slice(&54u32.to_le_bytes());
+            out.extend_from_slice(&40u32.to_le_bytes());
+            out.extend_from_slice(&(w as i32).to_le_bytes());
+            out.extend_from_slice(&(h as i32).to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&32u16.to_le_bytes());
+            out.extend_from_slice(&[0u8; 24]);
+            for row in (0..h).rev() {
+                let src = std::slice::from_raw_parts(mapped.bits.add(row * mapped.pitch as usize), w * 4);
+                for px in src.chunks_exact(4) {
+                    out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                }
+            }
+            cpu.Unmap()?;
+            std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new("."))).ok();
+            std::fs::write(path, out).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// A view-sized offscreen target that shares resources with the window target.
+    fn scene_target(&mut self, dc: &ID2D1DeviceContext, vw: f32, vh: f32) -> Result<ID2D1BitmapRenderTarget> {
+        if let Some((scene, size)) = &self.scene {
+            if *size == (vw, vh) {
+                return Ok(scene.clone());
+            }
+        }
+        let scene = unsafe {
+            dc.CreateCompatibleRenderTarget(Some(&D2D_SIZE_F { width: vw, height: vh }), None, None, D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE)?
+        };
+        self.scene = Some((scene.clone(), (vw, vh)));
+        Ok(scene)
     }
 
     fn draw_document(&mut self, dc: &ID2D1RenderTarget, pal: &Palette, view: &ViewState, vw: f32, vh: f32) -> Result<()> {
@@ -378,14 +515,24 @@ fn draw_scene(
         dc.Clear(Some(&color_f(pal.background)));
         let Some(layout) = layout else { return Ok(()) };
 
-        // Zoom gesture: scale around a point; the document is re-laid out when it settles.
+        // Zoom gesture: scale the whole view around (cx, cy); the document is re-laid out when
+        // it settles.
         let (s, cx, cy) = view.zoom.unwrap_or((1.0, 0.0, 0.0));
-        dc.SetTransform(&Matrix3x2 { M11: s, M12: 0.0, M21: 0.0, M22: s, M31: cx * (1.0 - s), M32: cy * (1.0 - s) });
-        // Visible document range, accounting for the zoom transform.
-        let top = view.scroll + (cy - cy / s);
-        let bottom = top + vh / s;
-        let dy = -view.scroll;
-        let _ = vw;
+        let columns = layout.columns.max(1);
+        let slot = if columns > 1 { layout.column_w } else { vw };
+        for col in 0..columns {
+        // Column `col` shows the slice of the document that follows column `col - 1`: text flows
+        // down one column and continues at the top of the next, like a newspaper.
+        let tx = col as f32 * slot;
+        dc.SetTransform(&Matrix3x2 { M11: s, M12: 0.0, M21: 0.0, M22: s, M31: tx * s + cx * (1.0 - s), M32: cy * (1.0 - s) });
+        if columns > 1 {
+            dc.PushAxisAlignedClip(&D2D_RECT_F { left: 0.0, top: 0.0, right: slot, bottom: vh }, D2D1_ANTIALIAS_MODE_ALIASED);
+        }
+        let scroll = view.scroll + col as f32 * vh;
+        // Visible document range, generous when the zoom transform magnifies or shrinks.
+        let top = scroll + (cy - cy / s).min(0.0);
+        let bottom = scroll + (cy + (vh - cy) / s).max(vh);
+        let dy = -scroll;
 
         for d in layout.under.iter().chain(layout.decos.iter()).filter(|d| d.bottom >= top && d.top <= bottom) {
             match &d.deco {
@@ -539,7 +686,17 @@ fn draw_scene(
             }
         }
 
+        if columns > 1 {
+            dc.PopAxisAlignedClip();
+        }
+        } // for col
+
         dc.SetTransform(&Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 });
+        // Faint rules between columns.
+        for col in 1..columns {
+            let x = (col as f32 * slot).round() + 0.5;
+            dc.DrawLine(pt(x, 0.0), pt(x, vh), &brush(pal.hr.with_alpha(0.6))?, 1.0, None);
+        }
     }
     Ok(())
 }
@@ -634,13 +791,13 @@ fn draw_icon(
 }
 
 /// Thumb rectangle in view coordinates for an overlay scrollbar of the given width,
-/// or None if everything fits.
-pub fn scrollbar_geometry(doc_h: f32, scroll: f32, vw: f32, vh: f32, width: f32) -> Option<D2D_RECT_F> {
-    if doc_h <= vh + 0.5 {
+/// or None if everything fits. `visible` is the document height on screen (all columns).
+pub fn scrollbar_geometry(doc_h: f32, scroll: f32, vw: f32, vh: f32, visible: f32, width: f32) -> Option<D2D_RECT_F> {
+    if doc_h <= visible + 0.5 {
         return None;
     }
-    let thumb_h = (vh * vh / doc_h).max(MIN_THUMB).min(vh);
-    let max_scroll = doc_h - vh;
+    let thumb_h = (vh * visible / doc_h).max(MIN_THUMB).min(vh);
+    let max_scroll = doc_h - visible;
     let thumb_top = (scroll / max_scroll).clamp(0.0, 1.0) * (vh - thumb_h);
     let right = vw - 3.0;
     Some(D2D_RECT_F { left: right - width, top: thumb_top + 3.0, right, bottom: thumb_top + thumb_h - 3.0 })
@@ -660,7 +817,7 @@ fn draw_scrollbar(
     if sb.alpha <= 0.01 {
         return Ok(());
     }
-    let Some(thumb) = scrollbar_geometry(layout.height, view.scroll, vw, vh, sb.width.max(2.0)) else { return Ok(()) };
+    let Some(thumb) = scrollbar_geometry(layout.height, view.scroll, vw, vh, layout.visible_height(vh), sb.width.max(2.0)) else { return Ok(()) };
     unsafe {
         if sb.track > 0.01 {
             let track = D2D_RECT_F { left: vw - SCROLLBAR_HIT_WIDTH, top: 0.0, right: vw, bottom: vh };
@@ -911,6 +1068,21 @@ fn draw_switcher(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::columns_for;
+
+    #[test]
+    fn columns_appear_only_when_two_fit() {
+        assert_eq!(columns_for(1000.0, 900.0), 1);
+        assert_eq!(columns_for(1799.0, 900.0), 1);
+        assert_eq!(columns_for(1800.0, 900.0), 2);
+        assert_eq!(columns_for(2700.0, 900.0), 3);
+        assert_eq!(columns_for(10_000.0, 40.0), 8, "capped");
+        assert_eq!(columns_for(500.0, 0.0), 1, "degenerate ideal width");
+    }
 }
 
 fn pt(x: f32, y: f32) -> D2D_POINT_2F {

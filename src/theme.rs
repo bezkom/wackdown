@@ -381,6 +381,9 @@ pub struct Config {
     pub zoom: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<WindowPlacement>,
+    /// Motion blur while scrolling (default on). `"motionBlur": false` turns it off.
+    #[serde(rename = "motionBlur", skip_serializing_if = "Option::is_none")]
+    pub motion_blur: Option<bool>,
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
 }

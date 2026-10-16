@@ -21,6 +21,8 @@ use crate::theme::{Palette, Rgba, WackDownTheme};
 
 /// Width of the scrollbar hit area on the right edge, in DIPs (the visible bar is an overlay).
 pub const SCROLLBAR_HIT_WIDTH: f32 = 14.0;
+/// Text used to measure a font's average character width for the reading measure.
+const MEASURE_SAMPLE: &str = "The quick brown fox jumps over the lazy dog, then naps.";
 
 /// A caret position: UTF-16 offset `pos` within text item `item`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -116,6 +118,11 @@ pub struct Layout {
     /// Laid-out height, plus an estimate for the rest while `complete` is false.
     pub height: f32,
     pub complete: bool,
+    /// Side-by-side columns the view is split into (1 = a normal page) and each one's width.
+    /// The layout itself is always a single column `column_w` wide; the renderer shows
+    /// consecutive view-height slices of it next to each other.
+    pub columns: usize,
+    pub column_w: f32,
 }
 
 impl Layout {
@@ -130,11 +137,27 @@ impl Layout {
             spans: Vec::new(),
             height: 0.0,
             complete: false,
+            columns: 1,
+            column_w: 0.0,
         }
     }
 
-    pub fn max_scroll(&self, view_h: f32) -> f32 {
-        (self.height - view_h).max(0.0)
+    /// Document height on screen at once: one view height per column.
+    pub fn visible_height(&self, view_h: f32) -> f32 {
+        view_h * self.columns.max(1) as f32
+    }
+
+    pub fn max_scroll(&self, visible_h: f32) -> f32 {
+        (self.height - visible_h).max(0.0)
+    }
+
+    /// View point to document point for a multi-column view: which column slice it is in.
+    pub fn view_to_doc(&self, x: f32, y: f32, scroll: f32, view_h: f32) -> (f32, f32) {
+        if self.columns <= 1 || self.column_w <= 0.0 {
+            return (x, y + scroll);
+        }
+        let col = ((x / self.column_w).floor().max(0.0) as usize).min(self.columns - 1);
+        (x - col as f32 * self.column_w, y + scroll + col as f32 * view_h)
     }
 
     /// Blocks laid out so far.
@@ -486,13 +509,14 @@ impl LayoutBuilder {
             let _ = code.SetIncrementalTabStop(digit_w * 4.0);
         }
 
-        // Columns: prose is `measure` average characters wide; code and tables may break out.
-        let avail = (width - SCROLLBAR_HIT_WIDTH).max(fs * 8.0);
-        let pad_x = (l.padding_x * z).min(avail * 0.12);
-        let outer_w = (avail - 2.0 * pad_x).max(fs * 6.0);
+        // `width` is the space this column may use (the renderer may show several side by side).
+        // Nothing is ever laid out wider than it: at extreme zoom a line simply holds fewer letters.
+        let avail = width.max(1.0);
+        let pad_x = (l.padding_x * z.min(2.0)).min(avail * 0.12);
+        let outer_w = (avail - 2.0 * pad_x).max(1.0);
         let max_w = if l.max_width > 0.0 { l.max_width * z } else { f32::MAX };
         let wide_w = outer_w.min(max_w);
-        let avg = average_advance(dwrite, &body, "The quick brown fox jumps over the lazy dog, then naps.").unwrap_or(fs * 0.5);
+        let avg = average_advance(dwrite, &body, MEASURE_SAMPLE).unwrap_or(fs * 0.5);
         let prose_w = if l.measure > 0.0 { (l.measure * avg).min(wide_w) } else { wide_w };
         let center = pad_x + outer_w / 2.0;
 
@@ -519,8 +543,9 @@ impl LayoutBuilder {
             wide_right: center + wide_w / 2.0,
             table_body,
             table_bold,
-            indent_step: fs * 1.8,
-            quote_step: fs * 1.2,
+            // Indents scale with the text but never eat more than a quarter of a narrow column.
+            indent_step: (fs * 1.8).min(avail * 0.25),
+            quote_step: (fs * 1.2).min(avail * 0.1),
             body,
             body_bold,
             code,
@@ -540,6 +565,20 @@ impl LayoutBuilder {
         let mut layout = Layout::empty();
         layout.height = builder.estimate_height(&layout);
         Ok((builder, layout))
+    }
+
+    /// The width one column wants at this zoom: the prose measure plus side padding. The view
+    /// splits into as many columns as fit this width side by side.
+    pub fn ideal_slot_width(dwrite: &IDWriteFactory, theme: &WackDownTheme, faces: &Faces, zoom: f32) -> Result<f32> {
+        let t = &theme.typography;
+        let l = &theme.layout;
+        let fs = t.font_size.clamp(6.0, 72.0) * zoom;
+        let line = fs * t.line_height.clamp(1.0, 3.0);
+        let body = make_format(dwrite, &faces.body, fs, false, line, faces.body.metrics.baseline(fs, line))?;
+        let avg = average_advance(dwrite, &body, MEASURE_SAMPLE).unwrap_or(fs * 0.5);
+        let max_w = if l.max_width > 0.0 { l.max_width * zoom } else { 960.0 * zoom };
+        let prose = if l.measure > 0.0 { (l.measure * avg).min(max_w) } else { max_w };
+        Ok(prose + 2.0 * l.padding_x.max(0.0) * zoom.min(2.0))
     }
 
     /// Lays out blocks until `until_y` and `until_block` are covered, then keeps going while

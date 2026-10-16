@@ -94,6 +94,9 @@ struct App {
     zoom_anchor: Option<((usize, f32), f32)>,
     /// Fades in the message that greets anyone who reaches either end of the zoom range.
     zoom_note: Fade,
+    /// Scroll position of the last drawn frame, for motion blur; and whether blur is enabled.
+    last_drawn_scroll: f32,
+    motion_blur: bool,
     /// (anchor, focus), unordered.
     selection: Option<(TextPos, TextPos)>,
     selecting: bool,
@@ -209,6 +212,8 @@ pub fn run_window_loop(file: Option<PathBuf>, startup_timer: Instant) -> Result<
             zoom: Zoom { committed: saved_zoom, visual: saved_zoom, target: saved_zoom, anchor_y: 0.0, last_input: now },
             zoom_anchor: None,
             zoom_note: Fade::default(),
+            last_drawn_scroll: 0.0,
+            motion_blur: config.motion_blur.unwrap_or(true),
             selection: None,
             selecting: false,
             press_link: None,
@@ -300,12 +305,24 @@ impl App {
         ((s - 1.0).abs() > 0.0005).then(|| (s, self.view_size().0 / 2.0, self.zoom.anchor_y))
     }
 
-    /// View point to document coordinates, undoing an in-flight zoom transform.
+    /// View point to document coordinates, undoing an in-flight zoom transform and mapping
+    /// through the column the point is in.
     fn to_doc(&self, x: f32, y: f32) -> (f32, f32) {
-        match self.zoom_transform() {
-            Some((s, cx, cy)) => (cx + (x - cx) / s, cy + (y - cy) / s + self.scroll.value),
+        let (x, y) = match self.zoom_transform() {
+            Some((s, cx, cy)) => (cx + (x - cx) / s, cy + (y - cy) / s),
+            None => (x, y),
+        };
+        let (_, vh) = self.view_size();
+        match self.renderer.layout() {
+            Some(l) => l.view_to_doc(x, y, self.scroll.value, vh),
             None => (x, y + self.scroll.value),
         }
+    }
+
+    /// Document height on screen: the view height times the number of columns.
+    fn visible_height(&self) -> f32 {
+        let (_, vh) = self.view_size();
+        self.renderer.layout().map_or(vh, |l| l.visible_height(vh))
     }
 
     fn line_height(&self) -> f32 {
@@ -471,9 +488,10 @@ impl App {
             return;
         };
         let (_, vh) = self.view_size();
+        let visible = self.visible_height();
         if let Some(r) = self.renderer.layout().and_then(|l| l.match_rects(m).into_iter().next()) {
             let top = self.scroll.target;
-            if r.top < top + 40.0 || r.bottom > top + vh - 40.0 {
+            if r.top < top + 40.0 || r.bottom > top + visible - 40.0 {
                 self.scroll_to(r.top - vh * 0.35);
             }
         }
@@ -657,10 +675,22 @@ impl App {
     /// the reading position stable across relayouts. Returns true when a new layout began.
     fn ensure_layout(&mut self) -> bool {
         let (_, vh) = self.view_size();
+        let visible = self.visible_height();
         let prior_anchor = self.renderer.layout().map(|l| l.block_at(self.scroll.value));
         let need_block = self.zoom_anchor.map(|(a, _)| a.0).or(prior_anchor.map(|a| a.0)).unwrap_or(0);
         let scale = self.zoom_transform().map_or(1.0, |(s, _, _)| s);
-        let need_y = self.scroll.value.max(self.scroll.target) + vh * 1.5 / scale.min(1.0);
+        let need_y = self.scroll.value.max(self.scroll.target) + visible * 1.5 / scale.min(1.0);
+        // A relayout that changes the zoom or the column count gets a crossfade from the old
+        // frame (plain resizes don't: a crisp live resize feels better than a smear).
+        if self.laid_doc_gen == self.doc_gen && self.renderer.layout().is_some() {
+            let theme = self.themes.current();
+            let zoom_changed = self.renderer.layout_zoom().is_some_and(|z| z != self.zoom.committed);
+            let columns_changed = self.renderer.layout().is_some_and(|l| l.columns != self.renderer.predict_columns(theme, self.zoom.committed));
+            if zoom_changed || columns_changed {
+                let view = ViewState { scroll: self.scroll.value.round(), selection: self.ordered_selection(), ..Default::default() };
+                let _ = self.renderer.begin_crossfade(&self.palette, &view);
+            }
+        }
         let theme = self.themes.current();
         let fresh = self
             .renderer
@@ -673,9 +703,10 @@ impl App {
                 // Extreme zoom can land the view on empty space (padding, the gap between giant
                 // lines): make sure some text is on screen.
                 let max = self.max_scroll();
+                let visible = self.visible_height();
                 let s = self.scroll.value.clamp(0.0, max);
                 if let Some(top) = self.renderer.layout().and_then(|l| l.nearest_text_top(s)) {
-                    if top > s + vh * 0.8 || top + self.line_height() < s {
+                    if top > s + visible * 0.8 || top + self.line_height() < s {
                         self.scroll.set((top - vh * 0.1).clamp(0.0, max));
                     }
                 }
@@ -837,7 +868,10 @@ impl App {
             find: self.find.as_ref().map(|f| FindView { query: f.query.clone(), count: f.matches.len(), current: f.current }),
             status,
             zoom_note: (self.zoom_note.value > 0.0).then_some((self.zoom.committed <= MIN_ZOOM, self.zoom_note.value)),
+            // Blur only follows animated motion (spring, thumb drag), never a jump or a relayout.
+            blur: if self.motion_blur && !fresh { self.scroll.value - self.last_drawn_scroll } else { 0.0 },
         };
+        self.last_drawn_scroll = self.scroll.value;
         match self.renderer.render(&self.palette, &view) {
             Ok(true) => {
                 if let Some(start) = self.startup.take() {
@@ -851,12 +885,14 @@ impl App {
                 }
             }
             Ok(false) => self.invalidate(),
-            Err(_) => {}
+            // A GUI process has no console, but a parent that redirects stderr still sees this.
+            Err(e) => eprintln!("[WackDown] render failed: {e:?}"),
         }
     }
 
     fn max_scroll(&self) -> f32 {
-        self.renderer.layout().map_or(0.0, |l| l.max_scroll(self.view_size().1))
+        let visible = self.visible_height();
+        self.renderer.layout().map_or(0.0, |l| l.max_scroll(visible))
     }
 
     /// Animated scroll to an absolute position.
@@ -1026,10 +1062,11 @@ impl App {
         let (vw, vh) = self.view_size();
         if let Some(grab) = self.drag_thumb {
             let Some(layout) = self.renderer.layout() else { return };
-            if let Some(thumb) = scrollbar_geometry(layout.height, self.scroll.value, vw, vh, 9.0) {
+            let visible = layout.visible_height(vh);
+            if let Some(thumb) = scrollbar_geometry(layout.height, self.scroll.value, vw, vh, visible, 9.0) {
                 let thumb_h = thumb.bottom - thumb.top + 6.0;
                 let frac = ((y - grab) / (vh - thumb_h).max(1.0)).clamp(0.0, 1.0);
-                let target = frac * layout.max_scroll(vh);
+                let target = frac * layout.max_scroll(visible);
                 self.jump_to(target);
             }
             return;
@@ -1147,11 +1184,12 @@ impl App {
         }
         let Some(layout) = self.renderer.layout() else { return };
         if x >= vw - SCROLLBAR_HIT_WIDTH {
-            if let Some(thumb) = scrollbar_geometry(layout.height, self.scroll.value, vw, vh, 9.0) {
+            let visible = layout.visible_height(vh);
+            if let Some(thumb) = scrollbar_geometry(layout.height, self.scroll.value, vw, vh, visible, 9.0) {
                 if y >= thumb.top && y <= thumb.bottom {
                     self.drag_thumb = Some(y - thumb.top + 3.0);
                 } else {
-                    let page = vh * 0.9;
+                    let page = visible * 0.9;
                     self.scroll_by(if y < thumb.top { -page } else { page });
                 }
                 self.invalidate();
@@ -1245,7 +1283,7 @@ impl App {
         }
         let (_, vh) = self.view_size();
         let line = self.line_height() * 2.0;
-        let page = (vh - self.line_height() * 2.0).max(self.line_height());
+        let page = (self.visible_height() - self.line_height() * 2.0).max(self.line_height());
         match vk {
             VK_DOWN => self.scroll_by(line),
             VK_UP => self.scroll_by(-line),
