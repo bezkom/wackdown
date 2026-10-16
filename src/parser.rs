@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 use pulldown_cmark::{Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
@@ -10,9 +10,11 @@ use pulldown_cmark::{Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLev
 #[derive(Debug, Default)]
 pub struct Document {
     pub blocks: Vec<Block>,
+    /// Folder the document was read from: relative image paths resolve against it.
+    pub base: Option<PathBuf>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash)]
 pub struct Block {
     pub kind: BlockKind,
     /// Number of enclosing list items / footnote definitions.
@@ -21,7 +23,7 @@ pub struct Block {
     pub quotes: Vec<Quote>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash)]
 pub struct Quote {
     /// List indent at which the quote was opened (where its bar is drawn).
     pub indent: u16,
@@ -29,7 +31,7 @@ pub struct Quote {
     pub callout: Option<Callout>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash)]
 pub enum BlockKind {
     Heading { level: u8, text: InlineText, anchor: String },
     Paragraph(InlineText),
@@ -44,12 +46,14 @@ pub enum BlockKind {
     DefinitionTerm(InlineText),
     /// Display math (`$$ ... $$`): Unicode when it converts faithfully, else the TeX source (`raw`).
     Math { text: String, raw: bool },
+    /// A paragraph that is nothing but one local image: shown as the picture itself.
+    Image { src: String, alt: String },
 }
 
 /// Prefix marking `[[wiki links]]` in `InlineText::links`; the rest is the page name.
 pub const WIKI_PREFIX: &str = "wiki:";
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum ListMarker {
     Bullet,
     Ordered(u64),
@@ -57,7 +61,7 @@ pub enum ListMarker {
     Footnote(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash)]
 pub enum Callout {
     Note,
     Tip,
@@ -66,7 +70,7 @@ pub enum Callout {
     Caution,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash)]
 pub enum Align {
     Left,
     Center,
@@ -74,21 +78,21 @@ pub enum Align {
 }
 
 /// Text in UTF-16 (what DirectWrite consumes) with styled runs.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Hash)]
 pub struct InlineText {
     pub text: Vec<u16>,
     pub runs: Vec<Run>,
     pub links: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash)]
 pub struct Run {
     pub start: u32,
     pub len: u32,
     pub style: Style,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Hash)]
 pub struct Style {
     pub bold: bool,
     pub italic: bool,
@@ -172,7 +176,41 @@ pub fn parse_file_to_document(path: &Path) -> std::io::Result<Document> {
     let map = unsafe { Mmap::map(&file)? };
     let text = decode(&map);
     drop(map);
-    Ok(parse_markdown(&text))
+    let mut doc = parse_markdown(&text);
+    doc.base = std::path::absolute(path).ok().and_then(|p| p.parent().map(Path::to_path_buf));
+    Ok(doc)
+}
+
+/// `https:`, `mailto:` etc. A single letter followed by ':' is a drive letter, not a scheme.
+pub fn has_scheme(url: &str) -> bool {
+    match url.split_once(':') {
+        Some((scheme, _)) => scheme.len() > 1 && scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.'),
+        None => false,
+    }
+}
+
+pub fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Images on disk are drawn; anything fetched over a network stays alt text (no network code).
+fn is_local_image(src: &str) -> bool {
+    let s = src.trim();
+    !s.is_empty() && (!has_scheme(s) || s.to_ascii_lowercase().starts_with("file:"))
 }
 
 /// Handles UTF-8 (with or without BOM) and UTF-16 LE/BE with BOM.
@@ -199,7 +237,7 @@ pub fn parse_markdown(source: &str) -> Document {
     }
     b.flush_text();
     b.flush();
-    Document { blocks: b.blocks }
+    Document { blocks: b.blocks, base: None }
 }
 
 fn options() -> Options {
@@ -260,6 +298,11 @@ struct Builder {
     table: Option<TableBuilder>,
     code: Option<(String, String)>,
     html: Option<String>,
+    /// An image that opened at the very start of the current paragraph: (src, text length before it).
+    image_start: Option<(String, usize)>,
+    /// That image, closed: (src, alt, paragraph text length right after it). The paragraph becomes
+    /// an `Image` block if nothing else follows.
+    sole_image: Option<(String, String, usize)>,
     in_metadata: bool,
     anchors: HashSet<String>,
     anchor_counts: HashMap<String, usize>,
@@ -289,8 +332,13 @@ impl Builder {
     /// Closes the currently open inline container, emitting its block.
     fn flush(&mut self) {
         let Some((open, text)) = self.open.take() else { return };
+        self.image_start = None;
+        let sole_image = self.sole_image.take();
         let kind = match open {
-            Open::Paragraph => BlockKind::Paragraph(text),
+            Open::Paragraph => match sole_image {
+                Some((src, alt, len)) if len == text.text.len() => BlockKind::Image { src, alt },
+                _ => BlockKind::Paragraph(text),
+            },
             Open::Heading(level, id) => {
                 let anchor = match id {
                     // `## Title {#custom-id}`: the author's id is used verbatim.
@@ -617,6 +665,16 @@ impl Builder {
             Tag::Link { link_type: LinkType::WikiLink { .. }, dest_url, .. } => self.links.push(format!("{WIKI_PREFIX}{dest_url}")),
             Tag::Link { dest_url, .. } => self.links.push(dest_url.to_string()),
             Tag::Image { dest_url, .. } => {
+                // A local image that opens a paragraph may become a picture (see `flush`).
+                let at_start = self.table.is_none()
+                    && self.image == 0
+                    && self.quotes.is_empty()
+                    && self.item_depth == 0
+                    && matches!(&self.open, None | Some((Open::Paragraph, _)))
+                    && self.open.as_ref().map_or(true, |(_, t)| t.is_empty());
+                if at_start && is_local_image(&dest_url) {
+                    self.image_start = Some((dest_url.to_string(), 0));
+                }
                 self.links.push(dest_url.to_string());
                 self.image += 1;
                 self.push_text("🖼 ", self.style(false));
@@ -700,6 +758,13 @@ impl Builder {
             TagEnd::Image => {
                 self.links.pop();
                 self.image = self.image.saturating_sub(1);
+                if let (Some((src, start)), 0) = (self.image_start.take(), self.image) {
+                    if let Some((Open::Paragraph, text)) = &self.open {
+                        // Skip the "🖼 " placeholder (2 UTF-16 units + space).
+                        let alt = String::from_utf16_lossy(&text.text[(start + 3).min(text.text.len())..]);
+                        self.sole_image = Some((src, alt.trim().to_string(), text.text.len()));
+                    }
+                }
             }
             TagEnd::CodeBlock | TagEnd::HtmlBlock | TagEnd::MetadataBlock(_) | TagEnd::DefinitionList => {}
         }
@@ -931,6 +996,23 @@ mod tests {
         let def = def.expect("footnote definition");
         assert!(def.plain().ends_with('↩'));
         assert_eq!(def.links, vec!["#fnref-src".to_string()]);
+    }
+
+    #[test]
+    fn sole_local_images_become_picture_blocks() {
+        let k = kinds("![A chart](img/chart.png)
+
+Text ![inline](a.png) more
+
+![remote](https://x.y/z.png)
+
+- ![in a list](b.png)
+");
+        assert!(matches!(&k[0], BlockKind::Image { src, alt } if src == "img/chart.png" && alt == "A chart"), "{:?}", k[0]);
+        assert!(matches!(&k[1], BlockKind::Paragraph(t) if t.plain().contains("inline")), "inline images stay text");
+        assert!(matches!(&k[2], BlockKind::Paragraph(t) if t.plain().contains("remote")), "remote images stay alt text");
+        assert!(matches!(&k[3], BlockKind::ListItem { .. }), "images inside list items stay text");
+        assert!(is_local_image("file:///C:/a.png") && is_local_image(r"C:\a.png") && !is_local_image("https://a/b.png"));
     }
 
     #[test]

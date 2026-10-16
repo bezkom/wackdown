@@ -10,11 +10,14 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
+use windows::Win32::System::Com::IStream;
 
 use crate::fonts::Fonts;
 use crate::gpu::{client_size, Gpu};
+use crate::images::ImageCache;
 use crate::layout::{color_f, get_brush, make_format, range_rects, Deco, Faces, Layout, LayoutBuilder, TextPos, SCROLLBAR_HIT_WIDTH};
 use crate::parser::{Callout, Document};
+use crate::print::{choose_printer, PrinterChoice};
 use crate::theme::{Palette, Rgba, WackDownTheme};
 
 const MIN_THUMB: f32 = 32.0;
@@ -120,6 +123,8 @@ pub struct Renderer {
     fade: Option<(ID2D1Bitmap, Instant)>,
     /// Offscreen copy of the document, used to composite motion blur; recreated on resize.
     scene: Option<(ID2D1BitmapRenderTarget, (f32, f32))>,
+    /// Decoded local images, per path.
+    images: ImageCache,
     ui: Option<UiFormats>,
     /// Wait for vertical blank when presenting (off in tests).
     vsync: bool,
@@ -159,6 +164,7 @@ impl Renderer {
                 layout_key: None,
                 fade: None,
                 scene: None,
+                images: ImageCache::new(),
                 ui: None,
                 vsync: !cfg!(test),
                 last_draw_ms: 0.0,
@@ -204,6 +210,7 @@ impl Renderer {
         self.layout_key = None;
         self.fade = None;
         self.scene = None;
+        self.images.clear();
     }
 
     /// Zoom the current layout was built for.
@@ -264,6 +271,10 @@ impl Renderer {
             if self.layout_key.is_some_and(|k| k.theme != theme_gen) {
                 self.brushes.clear();
             }
+            // A new document may have changed the pictures on disk.
+            if self.layout_key.is_some_and(|k| k.doc != doc_gen) {
+                self.images.clear();
+            }
             let faces = self.faces(theme);
             // Split the view into as many columns as the ideal column width fits.
             let avail = (width - SCROLLBAR_HIT_WIDTH).max(1.0);
@@ -285,7 +296,7 @@ impl Renderer {
     fn advance(&mut self, doc: &Document, need_y: f32, need_block: usize, deadline: Option<Instant>) -> Result<()> {
         if let (Some(builder), Some(layout)) = (self.builder.as_mut(), self.layout.as_mut()) {
             if !layout.complete {
-                builder.step(layout, doc, &mut self.brushes, need_y, need_block, deadline)?;
+                builder.step(layout, doc, &mut self.brushes, &mut self.images, need_y, need_block, deadline)?;
             }
             if layout.complete {
                 self.builder = None;
@@ -419,6 +430,86 @@ impl Renderer {
             std::fs::write(path, out).map_err(|e| Error::new(E_FAIL, e.to_string()))?;
         }
         Ok(())
+    }
+
+    /// Prints the document through the Windows print dialog ("Microsoft Print to PDF" included).
+    /// Pages are laid out afresh at 100% for the chosen paper, with the theme's padding as the
+    /// margin (pushed out to the printer's hardware margin if that is larger) and a footer with
+    /// the file name and page number. Returns false if the dialog was cancelled.
+    pub fn print(&mut self, hwnd: HWND, doc: &Document, theme: &WackDownTheme, pal: &Palette, title: &str) -> Result<bool> {
+        let Some(printer) = choose_printer(hwnd)? else { return Ok(false) };
+        self.print_to(&printer, None, doc, theme, pal, title)?;
+        Ok(true)
+    }
+
+    /// Prints to `printer`, or into `output` instead of the printer when given (tests).
+    /// Returns the number of pages.
+    pub fn print_to(&mut self, printer: &PrinterChoice, output: Option<&IStream>, doc: &Document, theme: &WackDownTheme, pal: &Palette, title: &str) -> Result<usize> {
+        let dc = self.ensure_gpu()?;
+        let device = self.gpu.as_ref().ok_or_else(|| Error::from(E_FAIL))?.device.clone();
+        let ui = self.ui_formats()?;
+        let wic = self.images.wic().cloned().ok_or_else(|| Error::from(E_FAIL))?;
+        let job = printer.open_job(title, output)?;
+        let control = unsafe { device.CreatePrintControl(&wic, &job, None)? };
+
+        let (page_w, page_h) = (printer.page_w, printer.page_h);
+        let (px, py, pr, pb) = printer.printable;
+        let mut print_theme = theme.clone();
+        // Every page gets the theme's vertical padding as its margin (pushed out to the hardware
+        // margin if that is larger); the document itself then needs none of its own.
+        let margin_y = print_theme.layout.padding_y.max(py.max(page_h - pb) + 12.0).max(36.0);
+        {
+            let l = &mut print_theme.layout;
+            l.padding_x = l.padding_x.max(px.max(page_w - pr) + 12.0);
+            l.padding_y = 0.0;
+        }
+        let content_h = (page_h - 2.0 * margin_y).max(page_h * 0.4);
+
+        let faces = self.faces(&print_theme);
+        let target: ID2D1RenderTarget = dc.cast()?;
+        let (mut builder, mut layout) = LayoutBuilder::new(&self.dwrite, &target, &print_theme, pal, faces, 1.0, page_w, doc)?;
+        layout.columns = 1;
+        layout.column_w = page_w;
+        let mut brushes = HashMap::new();
+        builder.step(&mut layout, doc, &mut brushes, &mut self.images, f32::MAX, usize::MAX, None)?;
+        let breaks = layout.page_breaks(content_h);
+        let pages = breaks.len();
+
+        let (factory, dwrite, round_stroke) = (self.factory.clone(), self.dwrite.clone(), self.round_stroke.clone());
+        let old_target = unsafe { dc.GetTarget().ok() };
+        let result = (|| -> Result<()> {
+            for (i, &top) in breaks.iter().enumerate() {
+                unsafe {
+                    let list = dc.CreateCommandList()?;
+                    dc.SetTarget(&list);
+                    dc.BeginDraw();
+                    target.Clear(Some(&color_f(pal.background)));
+                    // Document y `top` lands at the top margin of this page, and nothing past
+                    // the next page's start is shown here.
+                    let view = ViewState { scroll: top - margin_y, ..Default::default() };
+                    let end = breaks.get(i + 1).map_or(page_h - margin_y, |next| margin_y + (next - top)).min(page_h - margin_y);
+                    let clip = D2D_RECT_F { left: 0.0, top: margin_y - 2.0, right: page_w, bottom: end + 2.0 };
+                    target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
+                    let drawn = draw_scene(&target, &mut brushes, &factory, &dwrite, &ui, Some(&layout), round_stroke.as_ref(), pal, &view, page_w, page_h);
+                    target.PopAxisAlignedClip();
+                    drawn?;
+                    draw_page_footer(&target, &mut brushes, &dwrite, &ui, pal, title, i + 1, pages, page_w, page_h, margin_y)?;
+                    dc.EndDraw(None, None)?;
+                    list.Close()?;
+                    control.AddPage(&list, D2D_SIZE_F { width: page_w, height: page_h }, None::<&IStream>, None, None)?;
+                }
+            }
+            Ok(())
+        })();
+        unsafe {
+            if let Some(t) = old_target {
+                dc.SetTarget(&t);
+            }
+            let closed = control.Close();
+            result?;
+            closed?;
+        }
+        Ok(pages)
     }
 
     /// A view-sized offscreen target that shares resources with the window target.
@@ -566,6 +657,9 @@ fn draw_scene(
                 Deco::Icon { kind, cx, cy, size, color } => {
                     draw_icon(dc, factory, *kind, *cx, *cy + dy, *size, &brush(*color)?, round_stroke)?;
                 }
+                Deco::Image { bitmap, rect } => {
+                    dc.DrawBitmap(bitmap, Some(&offset(*rect, dy)), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                }
             }
         }
 
@@ -697,6 +791,33 @@ fn draw_scene(
             let x = (col as f32 * slot).round() + 0.5;
             dc.DrawLine(pt(x, 0.0), pt(x, vh), &brush(pal.hr.with_alpha(0.6))?, 1.0, None);
         }
+    }
+    Ok(())
+}
+
+/// "file name · page n / N", centered in the bottom margin of a printed page.
+#[allow(clippy::too_many_arguments)]
+fn draw_page_footer(
+    dc: &ID2D1RenderTarget,
+    brushes: &mut HashMap<u32, ID2D1SolidColorBrush>,
+    dwrite: &IDWriteFactory,
+    ui: &UiFormats,
+    pal: &Palette,
+    title: &str,
+    page: usize,
+    pages: usize,
+    page_w: f32,
+    page_h: f32,
+    margin_y: f32,
+) -> Result<()> {
+    let text = format!("{title}   ·   {page} / {pages}");
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    unsafe {
+        let tl = dwrite.CreateTextLayout(&wide, &ui.small, (page_w - 96.0).max(50.0), 20.0)?;
+        tl.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+        tl.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+        let y = page_h - margin_y / 2.0 - 8.0;
+        dc.DrawTextLayout(pt(48.0, y), &tl, &get_brush(brushes, dc, pal.text_dim)?, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
     }
     Ok(())
 }

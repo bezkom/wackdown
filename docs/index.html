@@ -166,7 +166,7 @@ footer p { margin: .4em 0; }
     <div class="row"><span>Accounts required</span><b>0</b></div>
     <div class="row"><span>Telemetry</span><b>0 g</b></div>
     <div class="row"><span>Fonts, embedded</span><b>3 cuts</b></div>
-    <div class="row thick"><span>Themes</span><b>6</b></div>
+    <div class="row thick"><span>Themes</span><b>8</b></div>
     <div class="fine">Percent daily values are based on a 2,000-tab diet. Contains Rust. Processed on GPUs that also process games.</div>
   </div>
 </header>
@@ -212,7 +212,10 @@ footer p { margin: .4em 0; }
     <div class="grid">
       <div class="card"><h3>Opens huge files instantly</h3><p>It lays out only what fits on your screen before the window appears, and does the rest a few milliseconds at a time while you read. The scrollbar politely estimates the length until it knows.</p></div>
       <div class="card"><h3>Draws with the GPU, not a browser</h3><p>Direct2D and DirectWrite, straight from Rust. Every frame is timed to your monitor's refresh rate, so scrolling and zooming feel like they belong to the OS, because they do.</p></div>
-      <div class="card"><h3>Six themes, zero CSS</h3><p>Cyberpunk Terminal, Tokyo Dusk, Monokai Pro Rust, Nordic Fjord, Solarized Deep Dark and Paper &amp; Gutenberg. Each pairs its own body, heading and code fonts. Write your own in a few lines of JSON.</p></div>
+      <div class="card"><h3>Eight themes, zero CSS</h3><p>Cyberpunk Terminal, Tokyo Dusk, Monokai Pro Rust, Nordic Fjord, Solarized Deep Dark and Paper &amp; Gutenberg, plus Monochrome Light and Dark for boring people. The picker can follow the Windows light/dark setting. Write your own in a few lines of JSON.</p></div>
+      <div class="card"><h3>Pictures, finally</h3><p>Local PNG, JPEG, GIF, BMP and WebP are drawn with the Windows imaging codecs and scaled to the column. Remote images show their alt text, because there is no network code to fetch them with.</p></div>
+      <div class="card"><h3>Built for agent output</h3><p>A file that is still being written reloads as it grows, the blocks that changed light up for a moment, and if you were at the end you stay at the end. Every file reopens where you left it. <kbd>Ctrl</kbd> <kbd>Shift</kbd> <kbd>A</kbd> keeps the window above your editor.</p></div>
+      <div class="card"><h3>Prints. To paper, or to PDF.</h3><p><kbd>Ctrl</kbd> <kbd>P</kbd> opens the Windows print dialog; pick <i>Microsoft Print to PDF</i> and you have a PDF. Pages break between blocks, dark themes print in grayscale, and no browser was harmed.</p></div>
       <div class="card"><h3>Brings its own typeface</h3><p>Iosevka, in monospace, sans and serif cuts, embedded in the exe. Your documents look the same on every machine, including the one where somebody uninstalled the fonts.</p></div>
       <div class="card"><h3>Reloads when you save</h3><p>Keep your real editor open next to it. Hit save, and ƜackDown has already redrawn by the time you look over. No "file changed on disk" dialog, because what else would you want?</p></div>
       <div class="card"><h3>Code blocks that respect identifiers</h3><p>Long lines scroll sideways instead of wrapping in the middle of <code>Api.Integrators</code>. Syntax colors for a dozen languages. A Copy button appears when you hover, then goes away again.</p></div>
@@ -253,7 +256,9 @@ footer p { margin: .4em 0; }
       <div><span>Find in page</span><span><kbd>Ctrl</kbd> <kbd>F</kbd>, then <kbd>Enter</kbd> / <kbd>F3</kbd></span></div>
       <div><span>Back / forward, after following a link</span><span><kbd>Backspace</kbd> / <kbd>Alt</kbd> <kbd>→</kbd></span></div>
       <div><span>Everything above, for mouse people</span><span>Right-click</span></div>
-      <div><span>Select all, copy</span><span><kbd>Ctrl</kbd> <kbd>A</kbd>, <kbd>Ctrl</kbd> <kbd>C</kbd></span></div>
+      <div><span>Select all, copy (plain and formatted)</span><span><kbd>Ctrl</kbd> <kbd>A</kbd>, <kbd>Ctrl</kbd> <kbd>C</kbd></span></div>
+      <div><span>Print, or save as PDF</span><span><kbd>Ctrl</kbd> <kbd>P</kbd></span></div>
+      <div><span>Always on top</span><span><kbd>Ctrl</kbd> <kbd>Shift</kbd> <kbd>A</kbd></span></div>
       <div><span>Reload file and themes</span><span><kbd>F5</kbd></span></div>
       <div><span>Help, with a tour of every feature</span><span><kbd>F1</kbd></span></div>
     </div>
@@ -268,9 +273,9 @@ footer p { margin: .4em 0; }
     <details><summary>Can I edit files with it?</summary><p>No. You already have an editor you like. Open the file there, keep ƜackDown next to it, and every save shows up instantly. Two small tools beat one big one; this was known in 1995.</p></details>
     <details><summary>Why is the M upside down?</summary><p>Because it's Markdown, turned on its head. The letter is Ɯ, U+019C, "Latin capital letter turned M". It has been sitting in Unicode since 1993 waiting for a job. We gave it one.</p></details>
     <details><summary>Windows says it doesn't recognize this app.</summary><p>Correct, and Windows is being honest: the files aren't code-signed yet, because certificates cost either money or reputation and we're starting with neither. Click <em>More info → Run anyway</em>, or verify the SHA-256 checksum published with every release, like the responsible adult you are. Starring the repo helps us qualify for free signing. That's not a joke; it's literally how the program works.</p></details>
-    <details><summary>Where does it keep my settings?</summary><p>One tiny JSON file in <code>%APPDATA%\WackDown</code> that remembers your theme, zoom and window size. Drop your own themes in a folder next to it. That's the whole configuration story.</p></details>
+    <details><summary>Where does it keep my settings?</summary><p>One tiny JSON file in <code>%APPDATA%\WackDown</code> that remembers your theme, zoom, window size, whether you pinned it on top, and where you were in the last hundred files. Drop your own themes in a folder next to it. That's the whole configuration story.</p></details>
     <details><summary>How far can I zoom?</summary><p>From 4%, where a document becomes a mood, to 5,000%, where a comma becomes a landscape. Most apps stop at 200% because nobody asked. We asked. There's something waiting for you at both ends.</p></details>
-    <details><summary>Does it support images?</summary><p>It shows their alt text, which is more than most people write. Real image rendering is on the list. Mermaid diagrams are shown as code, which is technically rendering.</p></details>
+    <details><summary>Does it support images?</summary><p>Local ones, yes: PNG, JPEG, GIF, BMP, WebP, decoded by Windows and scaled to the column. Remote ones show their alt text, because there is no network code. Mermaid diagrams are shown as code, which is technically rendering.</p></details>
     <details><summary>Who wrote this?</summary><p>An AI coding assistant (Claude Code), with a human holding the leash, reviewing the work and making the rude design decisions. The code is GPL-3.0, so you can read every line and judge for yourself.</p></details>
   </div>
 </section>
@@ -302,6 +307,8 @@ footer p { margin: .4em 0; }
     ["nordic-fjord", "Nordic Fjord", ["#161922", "#88c0d0", "#81a1c1", "#8fbcbb"]],
     ["solarized-deep-dark", "Solarized Deep Dark", ["#00141a", "#b58900", "#268bd2", "#2aa198"]],
     ["paper-gutenberg", "Paper & Gutenberg", ["#f7f4ed", "#a62424", "#2c3e50", "#593e2b"]],
+    ["monochrome-light", "Monochrome Light", ["#ffffff", "#000000", "#555555", "#1b1b1b"]],
+    ["monochrome-dark", "Monochrome Dark", ["#121212", "#ffffff", "#a8a8a8", "#d6d6d6"]],
     ["picker", "The picker itself", ["#090a0f", "#ffb400", "#ffb400", "#ffb400"]]
   ];
   var box = document.getElementById("themes"), img = document.getElementById("shot"), title = document.getElementById("shot-title");

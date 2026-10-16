@@ -16,6 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 pub struct Gpu {
     hwnd: HWND,
+    pub device: ID2D1Device,
     pub dc: ID2D1DeviceContext,
     swap_chain: IDXGISwapChain1,
     size: (u32, u32),
@@ -51,7 +52,7 @@ impl Gpu {
 
             let d2d_device = factory.CreateDevice(&dxgi_device)?;
             let dc = d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
-            let gpu = Self { hwnd, dc, swap_chain, size, dpi };
+            let gpu = Self { hwnd, device: d2d_device, dc, swap_chain, size, dpi };
             gpu.bind_back_buffer()?;
             Ok(gpu)
         }

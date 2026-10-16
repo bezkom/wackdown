@@ -19,8 +19,16 @@
 - **Zero Runtime Dependencies**: No Electron, no WebView2, no Chromium, no Node.js.
 - **Direct2D Hardware Rendering**: Zero HTML, zero CSS, pure GPU immediate-mode rasterization.
 - **Embedded Distinctive Typography**: Built-in [Iosevka](https://github.com/be5invis/Iosevka) in three cuts: monospace, Aile (sans) and Etoile (serif). Each theme pairs its own body, heading and code faces. No system font dependencies.
-- **Custom JSON Themes**: 6 rich pre-packaged mood themes with dynamic JSON customization.
+- **Custom JSON Themes**: 8 built-in themes (six moods, two deliberately boring monochrome ones) that
+  can follow the Windows light/dark setting, plus your own in a few lines of JSON.
 - **Full Emoji Support**: DirectWrite translated color glyph runs.
+- **Pictures**: local images (PNG, JPEG, GIF, BMP, WebP…) are drawn through the Windows imaging codecs
+  and scaled to the column. Remote images stay alt text: there is no network code.
+- **Made for agent output**: a file that is being written reloads as it grows, what changed is
+  highlighted, a view at the end stays at the end, and every file reopens where you left it.
+- **Print and PDF**: `Ctrl+P` goes through the Windows print dialog; "Microsoft Print to PDF" makes
+  the PDF. The same Direct2D drawing that goes on screen goes on paper.
+- **Rich copy**: a selection pastes into mail, Word or Teams with headings, lists, links and code intact.
 - **Motion in step with your display**: a DXGI flip-model swap chain paces every frame to the monitor's
   refresh rate (60, 120, 144 Hz…), with spring-based scrolling, fluid zoom and soft hover transitions.
 - **Huge files open instantly**: only the first screen is laid out before the window appears; the rest
@@ -71,7 +79,8 @@ CommonMark plus GitHub extensions: headings, emphasis, strikethrough, links, inl
 fenced code blocks with syntax highlighting, block quotes, GitHub callouts (`> [!NOTE]`, `TIP`,
 `IMPORTANT`, `WARNING`, `CAUTION`), bullet / ordered / task lists, tables with column alignment,
 horizontal rules, `#tags` and YAML front matter (hidden).
-Images are shown as their alt text; raw HTML blocks are shown as source.
+Local images are drawn (see **Pictures** below); remote images are shown as their alt text; raw HTML
+blocks are shown as source.
 
 Further extensions:
 
@@ -94,6 +103,13 @@ the serif cut (Iosevka Etoile). `$$…$$` gets its own centered line. It never g
 can't be expressed faithfully (matrices, alignments, letters with no Unicode super/subscript form,
 unknown commands), its TeX source is shown instead, monospaced.
 
+**Pictures.** A paragraph that is nothing but `![alt](path.png)` with a local path becomes the picture
+itself, decoded by the Windows Imaging Component (PNG, JPEG, GIF, BMP, TIFF, WebP and whatever codecs
+are installed), centered and scaled down to fit the text column, never enlarged past its pixel size
+at 100%. Paths resolve relative to the document. A picture that can't be read shows its alt text;
+images inside a sentence and images fetched over a network stay alt text, since ƜackDown has no
+network code.
+
 Not supported: Mermaid diagrams render as code blocks.
 
 ## Usage
@@ -107,12 +123,14 @@ Not supported: Mermaid diagrams render as code blocks.
 | Theme picker (live preview) | `Ctrl+T`, then `↑` `↓` to preview, `Enter` to keep, `Esc` to revert |
 | Next / previous theme | `T` / `Shift+T` |
 | Reload file and themes | `F5` (files also reload automatically when saved) |
-| Select / copy text | Drag, `Shift`+click, double-click, `Ctrl+A`, `Ctrl+C` |
+| Select / copy text | Drag, `Shift`+click, double-click, `Ctrl+A`; `Ctrl+C` copies plain text and formatted (HTML) text |
 | Follow link | Click — `#anchors` scroll, relative `.md` links open in place, URLs open in the browser |
 | Find in page | `Ctrl+F`, then type; `Enter` / `Shift+Enter` or `F3` / `Shift+F3` step through matches, `Esc` closes |
 | Back / forward | `Backspace` or `Alt+←` / `Alt+→`, mouse back and forward buttons |
-| Context menu | Right-click: copy, select all, find, open, themes, help; on a link: open it or copy its address |
+| Context menu | Right-click: copy, select all, find, open, print, themes, always on top, help; on a link: open it or copy its address |
 | Open file | `Ctrl+O` or drag and drop |
+| Print, or save as PDF | `Ctrl+P` (pick *Microsoft Print to PDF* for a PDF) |
+| Always on top | `Ctrl+Shift+A` |
 | Help | `F1` |
 
 Launched without a file argument, ƜackDown opens `README.md` from the current folder, or the built-in help.
@@ -125,9 +143,24 @@ Launched without a file argument, ƜackDown opens `README.md` from the current f
 - **Motion.** Fast scrolling is motion-blurred, and a zoom or column change crossfades from the
   previous frame instead of snapping. Both are cheap bitmap composites of the already-drawn page.
   Turn the blur off with `"motionBlur": false` in `%APPDATA%\WackDown\config.json`.
+- **Live files.** A file that changes on disk is re-read within a second, and the blocks that changed
+  are briefly highlighted. If the view was at the end of the file, it stays at the end as the file
+  grows, like `tail -f`: open the report an agent is writing and watch it arrive.
+- **Where you left off.** Every file reopens at the position you were reading; the last hundred files
+  are remembered in `config.json`.
+- **Always on top.** `Ctrl+Shift+A` keeps the window above the editor you are working in. Remembered.
+
+## Printing
+`Ctrl+P` opens the Windows print dialog; choose *Microsoft Print to PDF* to get a PDF. The document is
+laid out afresh for the paper size at 100%, blocks move to the next page rather than being cut (unless
+one is taller than a page), the theme's padding is the margin (pushed out to the printer's hardware
+margin if that is larger), and each page gets a footer with the file name and page number. Light
+themes print as they look on screen; dark themes print with *Monochrome Light*, so the page is not a
+slab of toner. No browser engine or PDF library is involved: the pages are Direct2D command lists
+handed to the Windows print pipeline.
 
 ## Custom Themes
-The six built-in themes live in `themes/` and are compiled into the binary. To add your own, drop a
+The eight built-in themes live in `themes/` and are compiled into the binary. To add your own, drop a
 `*.json` file into `%APPDATA%\WackDown\themes` (copy a built-in theme as a starting point).
 Only `name`, `colors.background` and `colors.text` are required — every other color, typography and
 layout value falls back to something derived from those. A custom theme with the same `id` as a
@@ -154,9 +187,21 @@ anything unavailable falls back to embedded Iosevka.
 | Tokyo Dusk | Iosevka Aile | Iosevka Aile |
 | Nordic Fjord | Iosevka Aile | Iosevka Etoile |
 | Paper & Gutenberg | Iosevka Etoile | Iosevka Etoile |
+| Monochrome Light | Iosevka Aile | Iosevka Aile |
+| Monochrome Dark | Iosevka Aile | Iosevka Aile |
 
-The selected theme, zoom level and window size and position are remembered in
-`%APPDATA%\WackDown\config.json`. That file is the entire configuration.
+The two monochrome themes are grayscale only, for boring people and for printing.
+
+**Follow Windows.** The first row of the theme picker (`Ctrl+T`) is *Follow Windows*: it pairs a light
+and a dark theme and switches between them with the Windows app color mode (Settings → Personalization →
+Colors), live. Choosing it adopts the current theme as the light or dark half of the pair, whichever it
+is; the other half defaults to Paper & Gutenberg or Cyberpunk Terminal. The pair is stored as
+`lightTheme` / `darkTheme` in `config.json`, with `"followSystem": true`. Picking any theme explicitly
+turns following off.
+
+The selected theme, zoom level, window size and position, always-on-top state and the reading position
+of the last hundred files are remembered in `%APPDATA%\WackDown\config.json`. That file is the entire
+configuration.
 
 ## Building for Windows 64
 Requires the Rust MSVC toolchain (`rustup`) and Visual Studio's **MSVC Build Tools for x64/x86** plus a

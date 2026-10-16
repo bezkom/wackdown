@@ -159,6 +159,11 @@ impl Rgba {
         0.2126 * self.r + 0.7152 * self.g + 0.0722 * self.b
     }
 
+    /// Light themes have a light background.
+    pub fn is_light(self) -> bool {
+        self.luminance() >= 0.5
+    }
+
     /// Packed key for brush caching.
     pub fn key(self) -> u32 {
         let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
@@ -295,23 +300,54 @@ impl WackDownTheme {
     }
 }
 
-pub(crate) const EMBEDDED_THEMES: [&str; 6] = [
+pub(crate) const EMBEDDED_THEMES: [&str; 8] = [
     include_str!("../themes/cyberpunk-terminal.json"),
     include_str!("../themes/tokyo-dusk.json"),
     include_str!("../themes/monokai-pro-rust.json"),
     include_str!("../themes/nordic-fjord.json"),
     include_str!("../themes/solarized-deep-dark.json"),
     include_str!("../themes/paper-gutenberg.json"),
+    include_str!("../themes/monochrome-light.json"),
+    include_str!("../themes/monochrome-dark.json"),
 ];
 
 const DEFAULT_THEME_ID: &str = "cyberpunk-terminal";
+/// Defaults for "follow Windows": the dark theme is the usual default, the light one is paper.
+const DEFAULT_DARK_ID: &str = DEFAULT_THEME_ID;
+const DEFAULT_LIGHT_ID: &str = "paper-gutenberg";
+/// Grayscale theme that dark themes print with.
+pub const PRINT_THEME_ID: &str = "monochrome-light";
 
-/// All available themes: the six embedded ones plus any `*.json` found in
+/// All available themes: the embedded ones plus any `*.json` found in
 /// `%APPDATA%\WackDown\themes`. A custom theme with the same `id` as an
 /// embedded one replaces it.
 pub struct ThemeSet {
     pub themes: Vec<WackDownTheme>,
     pub current: usize,
+    /// Follow the Windows light/dark setting, switching between `light` and `dark`.
+    pub follow: bool,
+    pub light: String,
+    pub dark: String,
+}
+
+/// Whether Windows apps are set to the light color mode (Settings → Personalization → Colors).
+pub fn system_is_light() -> bool {
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let mut value = 0u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut _),
+            Some(&mut size),
+        )
+    };
+    status.is_ok() && value != 0
 }
 
 impl ThemeSet {
@@ -343,13 +379,74 @@ impl ThemeSet {
             }
         }
 
-        let wanted = Config::load().theme.unwrap_or_else(|| DEFAULT_THEME_ID.to_string());
+        let config = Config::load();
+        let wanted = config.theme.unwrap_or_else(|| DEFAULT_THEME_ID.to_string());
         let current = themes.iter().position(|t| t.id == wanted).unwrap_or(0);
-        Self { themes, current }
+        let mut set = Self {
+            themes,
+            current,
+            follow: config.follow_system.unwrap_or(false),
+            light: config.light_theme.unwrap_or_else(|| DEFAULT_LIGHT_ID.to_string()),
+            dark: config.dark_theme.unwrap_or_else(|| DEFAULT_DARK_ID.to_string()),
+        };
+        set.apply_system();
+        set
     }
 
     pub fn current(&self) -> &WackDownTheme {
         &self.themes[self.current]
+    }
+
+    pub fn index_of(&self, id: &str) -> Option<usize> {
+        self.themes.iter().position(|t| t.id == id)
+    }
+
+    /// Picks a theme explicitly, leaving "follow Windows" mode.
+    pub fn select(&mut self, index: usize) {
+        if index < self.themes.len() {
+            self.current = index;
+            self.follow = false;
+        }
+    }
+
+    /// Turns "follow Windows" on, adopting the current theme as the light or dark half of the
+    /// pair (whichever it is), and switches to the half Windows is set to.
+    pub fn set_follow(&mut self) {
+        let cur = self.current();
+        if cur.palette().background.is_light() {
+            self.light = cur.id.clone();
+        } else {
+            self.dark = cur.id.clone();
+        }
+        self.follow = true;
+        self.apply_system();
+    }
+
+    /// In follow mode, switches to the theme matching Windows' current light/dark setting.
+    /// Returns true if the current theme changed.
+    pub fn apply_system(&mut self) -> bool {
+        if !self.follow {
+            return false;
+        }
+        let light = system_is_light();
+        let wanted = if light { &self.light } else { &self.dark };
+        let fallback = if light { DEFAULT_LIGHT_ID } else { DEFAULT_DARK_ID };
+        let index = self.index_of(wanted).or_else(|| self.index_of(fallback)).unwrap_or(self.current);
+        let changed = index != self.current;
+        self.current = index;
+        changed
+    }
+
+    /// The theme to print with: light themes print as they are, dark ones switch to the
+    /// grayscale light theme so the page isn't a slab of toner.
+    pub fn print_theme(&self) -> &WackDownTheme {
+        let cur = self.current();
+        if cur.palette().background.is_light() {
+            return cur;
+        }
+        self.index_of(PRINT_THEME_ID)
+            .or_else(|| self.themes.iter().position(|t| t.palette().background.is_light()))
+            .map_or(cur, |i| &self.themes[i])
     }
 
     /// Index of the next / previous theme, wrapping around.
@@ -358,10 +455,16 @@ impl ThemeSet {
         if forward { (self.current + 1) % n } else { (self.current + n - 1) % n }
     }
 
-    /// Remembers the current theme in `%APPDATA%\WackDown\config.json`.
+    /// Remembers the current theme (and the follow-Windows pair) in `%APPDATA%\WackDown\config.json`.
     pub fn save(&self) {
         let id = self.current().id.clone();
-        Config::update(|c| c.theme = Some(id));
+        let (follow, light, dark) = (self.follow, self.light.clone(), self.dark.clone());
+        Config::update(|c| {
+            c.theme = Some(id);
+            c.follow_system = follow.then_some(true);
+            c.light_theme = Some(light);
+            c.dark_theme = Some(dark);
+        });
     }
 }
 
@@ -384,8 +487,51 @@ pub struct Config {
     /// Motion blur while scrolling (default on). `"motionBlur": false` turns it off.
     #[serde(rename = "motionBlur", skip_serializing_if = "Option::is_none")]
     pub motion_blur: Option<bool>,
+    /// Switch between `lightTheme` and `darkTheme` with the Windows light/dark setting.
+    #[serde(rename = "followSystem", skip_serializing_if = "Option::is_none")]
+    pub follow_system: Option<bool>,
+    #[serde(rename = "lightTheme", skip_serializing_if = "Option::is_none")]
+    pub light_theme: Option<String>,
+    #[serde(rename = "darkTheme", skip_serializing_if = "Option::is_none")]
+    pub dark_theme: Option<String>,
+    /// Keep the window above all others.
+    #[serde(rename = "alwaysOnTop", skip_serializing_if = "Option::is_none")]
+    pub always_on_top: Option<bool>,
+    /// Reading positions of recently opened files, most recent first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent: Vec<RecentFile>,
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Where reading stopped in a file: the block at the top of the view and how far into it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecentFile {
+    pub path: String,
+    pub block: usize,
+    pub frac: f32,
+}
+
+/// How many files' reading positions are kept.
+pub const RECENT_LIMIT: usize = 100;
+
+impl Config {
+    /// Looks up the remembered position of `path` (case-insensitive, as Windows paths are).
+    pub fn recent_position(&self, path: &str) -> Option<(usize, f32)> {
+        let key = path.to_lowercase();
+        self.recent.iter().find(|r| r.path.to_lowercase() == key).map(|r| (r.block, r.frac))
+    }
+
+    /// Moves `path` to the front of the recent list with its new position; a position at the
+    /// very top is simply forgotten.
+    pub fn remember_position(&mut self, path: &str, block: usize, frac: f32) {
+        let key = path.to_lowercase();
+        self.recent.retain(|r| r.path.to_lowercase() != key);
+        if block > 0 || frac > 0.0 {
+            self.recent.insert(0, RecentFile { path: path.to_string(), block, frac });
+            self.recent.truncate(RECENT_LIMIT);
+        }
+    }
 }
 
 /// Last window position (physical pixels, restored-state rectangle) and whether it was maximized.
@@ -434,7 +580,27 @@ mod tests {
         let back = serde_json::to_string(&c).unwrap();
         assert!(back.contains("futureSetting"), "unknown keys survive: {back}");
         let empty: Config = serde_json::from_str("{}").unwrap();
-        assert!(empty.theme.is_none() && empty.window.is_none());
+        assert!(empty.theme.is_none() && empty.window.is_none() && empty.recent.is_empty());
+    }
+
+    #[test]
+    fn recent_positions_are_case_insensitive_and_bounded() {
+        let mut c = Config::default();
+        c.remember_position("C:\\Docs\\A.md", 3, 0.5);
+        assert_eq!(c.recent_position("c:\\docs\\a.md"), Some((3, 0.5)));
+        c.remember_position("c:\\docs\\a.md", 7, 0.0);
+        assert_eq!(c.recent.len(), 1, "same file is replaced, not duplicated");
+        assert_eq!(c.recent[0].block, 7);
+        for i in 0..(RECENT_LIMIT + 20) {
+            c.remember_position(&format!("f{i}.md"), 1, 0.0);
+        }
+        assert_eq!(c.recent.len(), RECENT_LIMIT);
+        assert_eq!(c.recent[0].path, format!("f{}.md", RECENT_LIMIT + 19), "most recent first");
+        c.remember_position("f5.md", 0, 0.0);
+        assert!(c.recent_position("f5.md").is_none(), "top of file is forgotten");
+        let json = serde_json::to_string(&c).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.recent, c.recent);
     }
 
     #[test]
@@ -448,10 +614,52 @@ mod tests {
 
     #[test]
     fn embedded_themes_load() {
+        let mut ids = Vec::new();
         for json in EMBEDDED_THEMES {
             let theme: WackDownTheme = serde_json::from_str(json).unwrap();
             assert!(!theme.id.is_empty());
             theme.palette();
+            ids.push(theme.id);
+        }
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), EMBEDDED_THEMES.len(), "theme ids are unique");
+        assert!(ids.iter().any(|i| i == PRINT_THEME_ID) && ids.iter().any(|i| i == DEFAULT_LIGHT_ID));
+    }
+
+    #[test]
+    fn follow_windows_picks_the_half_matching_the_system() {
+        let themes: Vec<WackDownTheme> = EMBEDDED_THEMES.iter().map(|j| serde_json::from_str(j).unwrap()).collect();
+        let mut set = ThemeSet { themes, current: 0, follow: false, light: DEFAULT_LIGHT_ID.into(), dark: DEFAULT_DARK_ID.into() };
+        let light = system_is_light();
+        set.set_follow();
+        assert!(set.follow);
+        assert_eq!(set.dark, DEFAULT_DARK_ID, "the dark default was current, so it stays the dark half");
+        assert_eq!(set.current().id, if light { DEFAULT_LIGHT_ID } else { DEFAULT_DARK_ID });
+        assert!(!set.apply_system(), "nothing changes while Windows stays put");
+        // Pretend Windows flipped by swapping the pair.
+        std::mem::swap(&mut set.light, &mut set.dark);
+        assert!(set.apply_system());
+        assert_eq!(set.current().id, if light { DEFAULT_DARK_ID } else { DEFAULT_LIGHT_ID });
+        let tokyo = set.index_of("tokyo-dusk").unwrap();
+        set.select(tokyo);
+        assert!(!set.follow && set.current().id == "tokyo-dusk");
+        assert_eq!(set.print_theme().id, PRINT_THEME_ID, "dark themes print in grayscale");
+        set.select(set.index_of("paper-gutenberg").unwrap());
+        assert_eq!(set.print_theme().id, "paper-gutenberg", "light themes print as they are");
+        set.set_follow();
+        assert_eq!(set.light, "paper-gutenberg", "a light theme becomes the light half");
+    }
+
+    #[test]
+    fn monochrome_themes_are_gray() {
+        for id in ["monochrome-light", "monochrome-dark"] {
+            let json = EMBEDDED_THEMES.iter().find(|j| j.contains(&format!("\"id\": \"{id}\""))).unwrap();
+            let theme: WackDownTheme = serde_json::from_str(json).unwrap();
+            let p = theme.palette();
+            for c in [p.background, p.text, p.headings[0], p.accent, p.link, p.code_keyword, p.callout_warning] {
+                assert!((c.r - c.g).abs() < 0.002 && (c.g - c.b).abs() < 0.002, "{id}: {c:?} is not gray");
+            }
         }
     }
 

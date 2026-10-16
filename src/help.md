@@ -15,12 +15,14 @@ A native Direct2D Markdown viewer. Drop a `.md` file onto this window, press **C
 | Next / previous theme | `T` / `Shift+T` |
 | Reload file and themes | `F5` (files also reload automatically when saved) |
 | Select text | Drag, `Shift`+click, double-click a word, `Ctrl+A` |
-| Copy selection | `Ctrl+C` |
+| Copy selection | `Ctrl+C` (plain text, and formatted for mail or Word) |
 | Follow link | Click; links to other `.md` files open here |
 | Find in page | `Ctrl+F`, then type; `Enter` / `Shift+Enter` or `F3` / `Shift+F3` step through matches, `Esc` closes |
 | Back / forward | `Backspace` or `Alt+←` / `Alt+→`, mouse back and forward buttons |
-| Context menu | Right-click: copy, select all, find, open, themes, help; on a link: open or copy its address |
+| Context menu | Right-click: copy, select all, find, open, print, themes, always on top, help; on a link: open or copy its address |
 | Open file | `Ctrl+O` or drag and drop |
+| Print, or save as PDF | `Ctrl+P`, then pick *Microsoft Print to PDF* for a PDF |
+| Always on top | `Ctrl+Shift+A` |
 | Help | `F1` |
 | Close | `Ctrl+W` |
 
@@ -28,9 +30,13 @@ A native Direct2D Markdown viewer. Drop a `.md` file onto this window, press **C
 
 Wide window, or zoomed out? The page splits into side-by-side columns that scroll together; text flows down one column and continues at the top of the next. Fast scrolling is motion-blurred (`"motionBlur": false` in `config.json` turns that off), and zoom changes crossfade instead of snapping.
 
+Files that change on disk are re-read within a second, and what changed is briefly highlighted. If you were at the end of the file, you stay at the end as it grows: open the report an agent is writing and watch it arrive. Every file reopens where you left it.
+
+Local images (`![alt](picture.png)` on a line of its own) are drawn, scaled to the column; remote images show their alt text, because ƜackDown has no network code.
+
 ## Themes {#themes-section}
 
-Six themes are built in: Cyberpunk Terminal, Tokyo Dusk, Monokai Pro Rust, Nordic Fjord, Solarized Deep Dark and Paper Gutenberg. Your choice is remembered in `%APPDATA%\WackDown\config.json`.
+Eight themes are built in: Cyberpunk Terminal, Tokyo Dusk, Monokai Pro Rust, Nordic Fjord, Solarized Deep Dark and Paper & Gutenberg, plus Monochrome Light and Monochrome Dark for boring people. The first row of the picker, **Follow Windows**, switches between a light and a dark theme with the Windows color mode. Your choice is remembered in `%APPDATA%\WackDown\config.json`. Dark themes print with Monochrome Light.
 
 > [!TIP]
 > Put your own `*.json` themes in `%APPDATA%\WackDown\themes`. Copy one of the built-in themes as a starting point — only `name`, `colors.background` and `colors.text` are required. A custom theme with the same `id` as a built-in one replaces it. Press **F5** to reload after editing.

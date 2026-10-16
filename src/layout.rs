@@ -6,6 +6,7 @@
 //! the blocks not laid out yet.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use windows::core::*;
@@ -16,7 +17,8 @@ use windows::Win32::Graphics::DirectWrite::*;
 
 use crate::fonts::FontChoice;
 use crate::highlight::{self, Token};
-use crate::parser::{Align, Block, BlockKind, Callout, Document, InlineText, ListMarker, Quote};
+use crate::images::ImageCache;
+use crate::parser::{percent_decode, Align, Block, BlockKind, Callout, Document, InlineText, ListMarker, Quote, Run, Style};
 use crate::theme::{Palette, Rgba, WackDownTheme};
 
 /// Width of the scrollbar hit area on the right edge, in DIPs (the visible bar is an overlay).
@@ -57,6 +59,8 @@ pub(crate) struct TextItem {
     pub color: Rgba,
     /// Index into `Layout::codes` when this item scrolls horizontally inside a code block.
     pub code: Option<usize>,
+    /// The document block this text belongs to.
+    pub block: usize,
 }
 
 pub(crate) enum Deco {
@@ -66,6 +70,7 @@ pub(crate) enum Deco {
     Text { layout: IDWriteTextLayout, x: f32, y: f32, color: Rgba },
     Check { rect: D2D_RECT_F, color: Rgba, width: f32 },
     Icon { kind: Callout, cx: f32, cy: f32, size: f32, color: Rgba },
+    Image { bitmap: ID2D1Bitmap, rect: D2D_RECT_F },
 }
 
 pub(crate) struct DecoItem {
@@ -104,6 +109,8 @@ struct Span {
     gtop: f32,
     top: f32,
     bottom: f32,
+    /// Headings travel with the block after them across page breaks.
+    heading: bool,
 }
 
 pub struct Layout {
@@ -123,6 +130,10 @@ pub struct Layout {
     /// consecutive view-height slices of it next to each other.
     pub columns: usize,
     pub column_w: f32,
+    /// Left and right edge of the prose column.
+    pub prose: (f32, f32),
+    /// Body line height.
+    pub line_h: f32,
 }
 
 impl Layout {
@@ -139,7 +150,61 @@ impl Layout {
             complete: false,
             columns: 1,
             column_w: 0.0,
+            prose: (0.0, 0.0),
+            line_h: 0.0,
         }
+    }
+
+    /// The document block a text item belongs to.
+    pub fn item_block(&self, item: usize) -> Option<usize> {
+        self.items.get(item).map(|it| it.block)
+    }
+
+    /// Document-space rectangle spanning blocks `first..=last` (those laid out so far).
+    pub fn blocks_rect(&self, first: usize, last: usize) -> Option<D2D_RECT_F> {
+        let last = last.min(self.spans.len().checked_sub(1)?);
+        let a = self.spans.get(first)?;
+        let b = self.spans.get(last)?;
+        Some(D2D_RECT_F { left: self.prose.0 - 8.0, top: a.top - 4.0, right: self.prose.1 + 8.0, bottom: b.bottom + 4.0 })
+    }
+
+    /// Document y where each printed page starts, for pages `page_h` tall. Blocks move to the
+    /// next page rather than being cut (taking a heading right above them along), unless one is
+    /// taller than a page.
+    pub fn page_breaks(&self, page_h: f32) -> Vec<f32> {
+        let page_h = page_h.max(1.0);
+        let mut breaks = vec![0.0f32];
+        let mut top = 0.0f32;
+        let mut i = 0;
+        while i < self.spans.len() {
+            let s = self.spans[i];
+            if s.bottom - top <= page_h {
+                i += 1;
+                continue;
+            }
+            // Something is already on this page: start a new one at this block, or at the
+            // heading that introduces it.
+            let mut first = i;
+            while first > 0 && self.spans[first - 1].heading {
+                first -= 1;
+            }
+            // (A heading that already starts this page stays; its text just runs on.)
+            if self.spans[first].top > top + 1.0 {
+                top = (self.spans[first].top - self.line_h * 0.5).max(0.0);
+                breaks.push(top);
+                if self.spans[first].bottom - top <= page_h {
+                    i = first + 1;
+                    continue;
+                }
+            }
+            // Taller than a page: let it run across as many as it needs.
+            while s.bottom - top > page_h {
+                top += page_h;
+                breaks.push(top);
+            }
+            i += 1;
+        }
+        breaks
     }
 
     /// Document height on screen at once: one view height per column.
@@ -420,6 +485,7 @@ fn weight(block: &Block) -> f64 {
         BlockKind::Table { rows, .. } => rows.iter().flatten().map(|c| c.text.len() + 20).sum(),
         BlockKind::DefinitionTerm(text) => text.text.len(),
         BlockKind::Math { text, .. } => text.len() + 40,
+        BlockKind::Image { .. } => 400,
         BlockKind::Rule | BlockKind::CalloutTitle(_) => 0,
     };
     units as f64 + 40.0
@@ -467,6 +533,8 @@ pub(crate) struct LayoutBuilder {
     /// Open level-0 quote group: (quote, top, index in `Layout::under` where its box goes, so
     /// nested bars added meanwhile are drawn on top of it).
     group: Option<(Quote, f32, usize)>,
+    /// Folder relative image paths resolve against.
+    base: Option<PathBuf>,
 }
 
 impl LayoutBuilder {
@@ -566,9 +634,12 @@ impl LayoutBuilder {
             laid_weight: 0.0,
             total_weight: doc.blocks.iter().map(weight).sum(),
             group: None,
+            base: doc.base.clone(),
         };
         let mut layout = Layout::empty();
         layout.height = builder.estimate_height(&layout);
+        layout.prose = (builder.left, builder.right);
+        layout.line_h = builder.line;
         Ok((builder, layout))
     }
 
@@ -588,11 +659,13 @@ impl LayoutBuilder {
 
     /// Lays out blocks until `until_y` and `until_block` are covered, then keeps going while
     /// `deadline` allows. With no deadline, stops as soon as the targets are met.
+    #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
         layout: &mut Layout,
         doc: &Document,
         brushes: &mut HashMap<u32, ID2D1SolidColorBrush>,
+        images: &mut ImageCache,
         until_y: f32,
         until_block: usize,
         deadline: Option<Instant>,
@@ -603,7 +676,7 @@ impl LayoutBuilder {
                 break;
             }
             let i = self.next;
-            self.block(layout, brushes, &doc.blocks, i)?;
+            self.block(layout, brushes, images, &doc.blocks, i)?;
             self.next += 1;
             self.laid_weight += weight(&doc.blocks[i]);
         }
@@ -657,7 +730,7 @@ impl LayoutBuilder {
         }
     }
 
-    fn block(&mut self, layout: &mut Layout, brushes: &mut HashMap<u32, ID2D1SolidColorBrush>, blocks: &[Block], i: usize) -> Result<()> {
+    fn block(&mut self, layout: &mut Layout, brushes: &mut HashMap<u32, ID2D1SolidColorBrush>, images: &mut ImageCache, blocks: &[Block], i: usize) -> Result<()> {
         let block = &blocks[i];
         let prev = i.checked_sub(1).map(|p| &blocks[p]);
         let gap = self.gap_before(prev, block);
@@ -764,9 +837,10 @@ impl LayoutBuilder {
                 self.inline(layout, brushes, &text, &self.body_bold.clone(), color, tx, (w - (tx - x)).max(self.fs), sep, DWRITE_TEXT_ALIGNMENT_LEADING)?
             }
             BlockKind::Table { aligns, rows } => self.table(layout, brushes, aligns, rows, x, w, sep)?,
+            BlockKind::Image { src, alt } => self.image(layout, brushes, images, src, alt, x, w, sep)?,
         };
         self.y = top + h;
-        layout.spans.push(Span { gtop, top, bottom: self.y });
+        layout.spans.push(Span { gtop, top, bottom: self.y, heading: matches!(block.kind, BlockKind::Heading { .. }) });
         // Block i-1's quote bars can be finalized now that block i's position is known.
         self.close_quotes(layout, blocks, i);
         Ok(())
@@ -941,8 +1015,43 @@ impl LayoutBuilder {
                 push(&mut layout.decos, rect.top, rect.bottom, Deco::Fill { rect, color, radius: 3.5 * self.z });
             }
         }
-        layout.items.push(TextItem { layout: tl, x, y, w, h, text: inline.text.clone(), sep, links, color, code: None });
+        layout.items.push(TextItem { layout: tl, x, y, w, h, text: inline.text.clone(), sep, links, color, code: None, block: self.next });
         Ok(h)
+    }
+
+    /// A picture: scaled to fit the column (never enlarged past its pixel size at 100%), centered.
+    /// If the file can't be read or decoded, its alt text is shown instead, like an inline image.
+    #[allow(clippy::too_many_arguments)]
+    fn image(
+        &mut self,
+        layout: &mut Layout,
+        brushes: &mut HashMap<u32, ID2D1SolidColorBrush>,
+        images: &mut ImageCache,
+        src: &str,
+        alt: &str,
+        x: f32,
+        w: f32,
+        sep: Sep,
+    ) -> Result<f32> {
+        let rel = percent_decode(src.trim().trim_start_matches("file:///").trim_start_matches("file://"));
+        let path = match &self.base {
+            Some(base) => base.join(&rel),
+            None => PathBuf::from(&rel),
+        };
+        if let Some(pic) = images.get(&self.target, &path) {
+            let natural_w = pic.width * self.z;
+            let scale = (w / natural_w).min(1.0);
+            let (dw, dh) = (natural_w * scale, pic.height * self.z * scale);
+            let left = x + (w - dw) / 2.0;
+            let rect = D2D_RECT_F { left, top: self.y, right: left + dw, bottom: self.y + dh };
+            push(&mut layout.decos, rect.top, rect.bottom, Deco::Image { bitmap: pic.bitmap, rect });
+            return Ok(dh);
+        }
+        let shown = if alt.is_empty() { format!("🖼 {rel}") } else { format!("🖼 {alt}") };
+        let units: Vec<u16> = shown.encode_utf16().collect();
+        let len = units.len() as u32;
+        let inline = InlineText { text: units, runs: vec![Run { start: 0, len, style: Style { italic: true, image: true, ..Style::default() } }], links: Vec::new() };
+        self.inline(layout, brushes, &inline, &self.body.clone(), self.pal.text_dim, x, w, sep, DWRITE_TEXT_ALIGNMENT_LEADING)
     }
 
     fn marker(&mut self, layout: &mut Layout, marker: &ListMarker, indent: u16, x: f32, top: f32) -> Result<()> {
@@ -1056,6 +1165,7 @@ impl LayoutBuilder {
             links: Vec::new(),
             color: self.pal.code_text,
             code: Some(code_index),
+            block: self.next,
         });
 
         // Background goes under the header label and separator.
@@ -1242,6 +1352,36 @@ mod tests {
         let aa: Vec<u16> = "aa".encode_utf16().collect();
         assert_eq!(find_units(&hay, &aa), vec![(20, 2)], "overlapping hits are not double counted");
         assert!(find_units(&hay, &[]).is_empty());
+    }
+
+    #[test]
+    fn page_breaks_move_whole_blocks_and_split_tall_ones() {
+        let mut l = super::Layout::empty();
+        l.line_h = 20.0;
+        let span = |gtop: f32, top: f32, bottom: f32| super::Span { gtop, top, bottom, heading: false };
+        // Three 300-tall blocks, then one 2500-tall block, on 1000-tall pages.
+        l.spans = vec![span(0.0, 0.0, 300.0), span(300.0, 320.0, 620.0), span(620.0, 640.0, 940.0), span(940.0, 960.0, 1260.0), span(1260.0, 1280.0, 3780.0)];
+        let breaks = l.page_breaks(1000.0);
+        assert_eq!(breaks[0], 0.0);
+        assert_eq!(breaks[1], 950.0, "the block that doesn't fit starts the next page (half a line above it)");
+        assert_eq!(breaks[2], 1270.0, "the tall block starts a page...");
+        assert_eq!(&breaks[3..], &[2270.0, 3270.0], "...and runs across two more");
+        assert!(l.page_breaks(0.0).len() < 10_000, "degenerate page height can't explode");
+    }
+
+    #[test]
+    fn page_breaks_keep_headings_with_their_text() {
+        let mut l = super::Layout::empty();
+        l.line_h = 20.0;
+        let span = |top: f32, bottom: f32, heading: bool| super::Span { gtop: top - 10.0, top, bottom, heading };
+        // A paragraph, a heading near the bottom of the page, and the paragraph that overflows.
+        l.spans = vec![span(0.0, 800.0, false), span(850.0, 890.0, true), span(900.0, 1100.0, false), span(1110.0, 1200.0, false)];
+        let breaks = l.page_breaks(1000.0);
+        assert_eq!(breaks, vec![0.0, 840.0], "the heading moves to the next page with its paragraph: {breaks:?}");
+        // A heading that starts a page stays put even if its paragraph is huge.
+        l.spans = vec![span(0.0, 40.0, true), span(50.0, 2500.0, false)];
+        let breaks = l.page_breaks(1000.0);
+        assert_eq!(breaks, vec![0.0, 1000.0, 2000.0], "{breaks:?}");
     }
 
     #[test]

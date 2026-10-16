@@ -22,10 +22,12 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use windows::core::w;
 use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP};
 
 use crate::highlight::highlight;
 use crate::parser::{parse_file_to_document, parse_markdown, BlockKind, Document, InlineText};
+use crate::print::PrinterChoice;
 use crate::renderer::{CodeChrome, FindView, Renderer, ScrollbarView, SwitcherEntry, SwitcherView, ViewState};
 use crate::theme::{WackDownTheme, EMBEDDED_THEMES};
 
@@ -175,6 +177,10 @@ fn check_doc(doc: &Document, input: &str, ctx: &str) {
                 assert!(!text.contains('\u{0}') || input.contains('\u{0}'), "{ctx}: math invented NULs");
                 total_units += text.encode_utf16().count();
             }
+            BlockKind::Image { src, alt } => {
+                assert!(!src.is_empty(), "{ctx}: image without a source");
+                total_units += src.encode_utf16().count() + alt.encode_utf16().count();
+            }
             BlockKind::Rule | BlockKind::CalloutTitle(_) => {}
         }
     }
@@ -200,6 +206,8 @@ struct Harness {
 
 impl Harness {
     fn new(width: i32, height: i32) -> Self {
+        // COM for image decoding, as the real window does.
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
         let hwnd = unsafe {
             CreateWindowExW(WINDOW_EX_STYLE::default(), w!("STATIC"), w!(""), WS_POPUP, 0, 0, width, height, None, None, None, None)
         }
@@ -529,6 +537,176 @@ fn snapshots_render_offscreen() {
     assert_eq!(h.renderer.layout().unwrap().columns, 1, "one column at 100% in 1900px");
     h.renderer.snapshot_bmp(&pal, &ViewState { scroll: 0.0, ..Default::default() }, &dir.join("single.bmp")).unwrap();
     eprintln!("snapshots written to {}", dir.display());
+}
+
+/// A tiny 24-bit BMP (WIC decodes it like any other image), `w` x `h`, filled with one color.
+fn write_bmp(path: &std::path::Path, w: u32, h: u32, rgb: [u8; 3]) {
+    let row = (w * 3 + 3) & !3;
+    let size = 54 + row * h;
+    let mut out = Vec::with_capacity(size as usize);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(w as i32).to_le_bytes());
+    out.extend_from_slice(&(h as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&[0u8; 24]);
+    for _ in 0..h {
+        for _ in 0..w {
+            out.extend_from_slice(&[rgb[2], rgb[1], rgb[0]]);
+        }
+        out.extend(std::iter::repeat(0u8).take((row - w * 3) as usize));
+    }
+    std::fs::write(path, out).unwrap();
+}
+
+#[test]
+fn local_images_are_drawn_and_missing_ones_fall_back_to_alt_text() {
+    let dir = std::env::temp_dir().join(format!("wackdown-images-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    write_bmp(&dir.join("wide.bmp"), 1600, 200, [40, 120, 200]);
+    write_bmp(&dir.join("small.bmp"), 64, 48, [200, 60, 60]);
+    let md = "# Pictures\n\n![A wide one](wide.bmp)\n\n![Small](small.bmp)\n\n![Gone](missing.png)\n\n![Remote](https://example.com/x.png)\n\nText after.\n";
+    std::fs::write(dir.join("doc.md"), md).unwrap();
+    let doc = parse_file_to_document(&dir.join("doc.md")).unwrap();
+    assert_eq!(doc.base.as_deref(), Some(dir.as_path()));
+    assert_eq!(doc.blocks.iter().filter(|b| matches!(b.kind, BlockKind::Image { .. })).count(), 3, "three local image blocks");
+
+    let mut h = Harness::new(900, 700);
+    h.exercise(&doc, 0, 1.0, "images");
+    let layout = h.renderer.layout().unwrap();
+    let pictures: Vec<_> = layout
+        .decos
+        .iter()
+        .filter_map(|d| match &d.deco {
+            crate::layout::Deco::Image { rect, .. } => Some(*rect),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pictures.len(), 2, "two images decoded, one missing");
+    let (wide, small) = (pictures[0], pictures[1]);
+    let column = layout.prose.1 - layout.prose.0;
+    assert!(wide.right - wide.left <= column + 0.5, "wide image fits the column: {wide:?} in {column}");
+    assert!(((wide.right - wide.left) / (wide.bottom - wide.top) - 8.0).abs() < 0.05, "aspect ratio kept");
+    assert!((small.right - small.left - 64.0).abs() < 0.5 && (small.bottom - small.top - 48.0).abs() < 0.5, "small image at pixel size");
+    assert!(small.top > wide.bottom, "images stack in order");
+    let texts: Vec<String> = layout.items.iter().map(|it| String::from_utf16_lossy(&it.text)).collect();
+    assert!(texts.iter().any(|t| t.contains("Gone")), "missing image shows its alt text: {texts:?}");
+    assert!(texts.iter().any(|t| t.contains("Remote")), "remote image stays alt text");
+    assert!(texts.iter().any(|t| t == "Text after."));
+
+    // Rich-text copy of everything mentions the picture and keeps the heading.
+    let sel = layout.select_all().unwrap();
+    let html = crate::html::selection_html(&doc, layout, sel);
+    assert!(html.starts_with("<h1>Pictures</h1>"), "{html}");
+    assert!(html.contains("<img src=\"file:///") && html.contains("wide.bmp"), "{html}");
+    assert!(html.ends_with("<p>Text after.</p>"), "{html}");
+
+    // At 50% the small image shrinks with the text; at 300% the wide one still fits the column.
+    h.exercise(&doc, 1, 0.5, "images at 50%");
+    let layout = h.renderer.layout().unwrap();
+    let small = layout.decos.iter().filter_map(|d| match &d.deco { crate::layout::Deco::Image { rect, .. } => Some(*rect), _ => None }).nth(1).unwrap();
+    assert!((small.right - small.left - 32.0).abs() < 0.5, "{small:?}");
+    h.exercise(&doc, 2, 3.0, "images at 300%");
+    let layout = h.renderer.layout().unwrap();
+    for r in layout.decos.iter().filter_map(|d| match &d.deco { crate::layout::Deco::Image { rect, .. } => Some(*rect), _ => None }) {
+        assert!(r.right - r.left <= layout.prose.1 - layout.prose.0 + 0.5, "{r:?}");
+    }
+    let snap = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("snapshots").join("images.bmp");
+    h.exercise(&doc, 0, 1.0, "images snapshot");
+    let pal = h.themes[0].palette();
+    h.renderer.snapshot_bmp(&pal, &ViewState { scroll: 0.0, ..Default::default() }, &snap).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn selection_html_clips_to_the_selected_text() {
+    let doc = parse_markdown("# Title\n\nFirst **bold** paragraph.\n\n- one\n- two\n\n```rust\nfn a() {}\nfn b() {}\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n");
+    let mut h = Harness::new(800, 600);
+    h.exercise(&doc, 0, 1.0, "html");
+    let layout = h.renderer.layout().unwrap();
+    let all = crate::html::selection_html(&doc, layout, layout.select_all().unwrap());
+    assert!(all.starts_with("<h1>Title</h1><p>First <b>bold</b> paragraph.</p><ul><li>one</li><li>two</li></ul><pre><code class=\"language-rust\">fn a() {}\nfn b() {}</code></pre><table"), "{all}");
+    assert!(all.contains("<th>a</th>") && all.contains("<td>2</td>") && all.ends_with("</table>"), "{all}");
+    // From the middle of the paragraph to the middle of the code block.
+    let para = layout.items.iter().position(|it| String::from_utf16_lossy(&it.text).starts_with("First")).unwrap();
+    let code = layout.items.iter().position(|it| it.code.is_some()).unwrap();
+    let part = crate::html::selection_html(&doc, layout, (crate::layout::TextPos { item: para, pos: 6 }, crate::layout::TextPos { item: code, pos: 9 }));
+    assert_eq!(part, "<p><b>bold</b> paragraph.</p><ul><li>one</li><li>two</li></ul><pre><code class=\"language-rust\">fn a() {}</code></pre>", "{part}");
+}
+
+/// Prints the help page into a stream through "Microsoft Print to PDF" (the real Direct2D print
+/// pipeline, no dialog) and keeps the result at target/snapshots/print.pdf for a human to open.
+#[test]
+fn prints_to_a_pdf_stream() {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::Com::StructuredStorage::{CreateStreamOnHGlobal, GetHGlobalFromStream};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    let doc = parse_markdown(include_str!("help.md"));
+    let mut h = Harness::new(800, 600);
+    let theme = h.themes.iter().find(|t| t.id == crate::theme::PRINT_THEME_ID).unwrap().clone();
+    let pal = theme.palette();
+    let printer = PrinterChoice::letter("Microsoft Print to PDF");
+    let stream = unsafe { CreateStreamOnHGlobal(HGLOBAL::default(), true) }.unwrap();
+    let pages = match h.renderer.print_to(&printer, Some(&stream), &doc, &theme, &pal, "help.md") {
+        Ok(pages) => pages,
+        // Build agents without the PDF printer can't run this one; a developer machine must.
+        Err(e) if std::env::var_os("CI").is_some() => {
+            eprintln!("skipped: Microsoft Print to PDF unavailable ({e})");
+            return;
+        }
+        Err(e) => panic!("print failed: {e}"),
+    };
+    assert!(pages >= 2, "the help page should need more than one Letter page, got {pages}");
+    let bytes = unsafe {
+        let global = GetHGlobalFromStream(&stream).unwrap();
+        let size = GlobalSize(global);
+        let ptr = GlobalLock(global) as *const u8;
+        let bytes = std::slice::from_raw_parts(ptr, size).to_vec();
+        let _ = GlobalUnlock(global);
+        bytes
+    };
+    assert!(bytes.len() > 10_000, "print output is only {} bytes", bytes.len());
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("snapshots");
+    std::fs::create_dir_all(&dir).unwrap();
+    let is_pdf = bytes.starts_with(b"%PDF");
+    std::fs::write(dir.join(if is_pdf { "print.pdf" } else { "print.bin" }), &bytes).unwrap();
+    assert!(is_pdf, "expected a PDF from the PDF printer, got {:?}", &bytes[..8]);
+    eprintln!("{pages} pages, {} bytes of PDF", bytes.len());
+}
+
+/// Renders the website gallery pictures offscreen: the two monochrome themes and the theme picker
+/// (with its "Follow Windows" row) on docs/hero.md at the gallery's 1000x721.
+#[test]
+fn gallery_snapshots() {
+    let hero = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs").join("hero.md")).unwrap();
+    let doc = parse_markdown(&hero);
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("snapshots");
+    let mut h = Harness::new(1000, 721);
+    let pal_of = |id: &str| h.themes.iter().find(|t| t.id == id).unwrap().palette();
+    for (gen, id) in ["monochrome-light", "monochrome-dark"].iter().enumerate() {
+        let theme = h.themes.iter().find(|t| &t.id == id).unwrap().clone();
+        let pal = theme.palette();
+        h.renderer.ensure_layout(&doc, &theme, &pal, 1, gen as u64 + 1, 1.0, f32::MAX, usize::MAX, Duration::from_secs(30)).unwrap();
+        h.renderer.finish_layout(&doc).unwrap();
+        h.renderer.snapshot_bmp(&pal, &ViewState { scroll: 0.0, ..Default::default() }, &dir.join(format!("theme-{id}.bmp"))).unwrap();
+    }
+    // The picker as the app shows it: Follow Windows first (paper / cyberpunk halves), then every theme.
+    let (light, dark) = (pal_of("paper-gutenberg"), pal_of("cyberpunk-terminal"));
+    let mut entries = vec![SwitcherEntry { name: "Follow Windows".into(), swatches: [light.background, light.headings[0], dark.background, dark.headings[0]] }];
+    entries.extend(h.themes.iter().map(|t| {
+        let p = t.palette();
+        SwitcherEntry { name: t.name.clone(), swatches: [p.background, p.headings[0], p.headings[1], p.headings[2]] }
+    }));
+    let theme = h.themes[0].clone();
+    let pal = theme.palette();
+    h.renderer.ensure_layout(&doc, &theme, &pal, 1, 9, 1.0, f32::MAX, usize::MAX, Duration::from_secs(30)).unwrap();
+    h.renderer.finish_layout(&doc).unwrap();
+    let view = ViewState { scroll: 0.0, switcher: Some(SwitcherView { entries: &entries, selected: 1, hover: None, stats: None }), ..Default::default() };
+    h.renderer.snapshot_bmp(&pal, &view, &dir.join("picker.bmp")).unwrap();
 }
 
 #[test]

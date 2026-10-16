@@ -1,3 +1,5 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -5,7 +7,8 @@ use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
-use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
+use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData};
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
@@ -18,8 +21,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim::{ease_out, Fade, Spring};
 use crate::fonts::wide;
+use crate::html;
 use crate::layout::{TextPos, SCROLLBAR_HIT_WIDTH};
-use crate::parser::{parse_file_to_document, parse_markdown, Document, WIKI_PREFIX};
+use crate::parser::{has_scheme, parse_file_to_document, parse_markdown, percent_decode, Document, WIKI_PREFIX};
 use crate::renderer::{
     scrollbar_geometry, switcher_rect, switcher_row_at, CodeChrome, FindView, Renderer, ScrollbarView, SwitcherEntry, SwitcherView, ViewState,
 };
@@ -38,6 +42,8 @@ const LAYOUT_BUDGET: Duration = Duration::from_millis(6);
 /// Scrolling spring stiffness (rad/s).
 const SCROLL_OMEGA: f32 = 24.0;
 const FLASH: Duration = Duration::from_millis(1100);
+/// Blocks that changed on reload stay highlighted a little longer than a jump target.
+const BLOCK_FLASH: Duration = Duration::from_millis(1800);
 const COPIED: Duration = Duration::from_millis(1400);
 /// The overlay scrollbar stays visible this long after the last scroll.
 const SCROLLBAR_LINGER: Duration = Duration::from_millis(900);
@@ -58,9 +64,25 @@ enum CursorKind {
 }
 
 struct Switcher {
-    /// Theme to restore on Esc.
+    /// Theme (and follow-Windows state) to restore on Esc.
     original: usize,
+    original_follow: bool,
     hover: Option<usize>,
+}
+
+/// What is briefly highlighted: a heading just jumped to, or the blocks a reload changed.
+enum Flash {
+    Anchor(String),
+    Blocks(usize, usize),
+}
+
+impl Flash {
+    fn duration(&self) -> Duration {
+        match self {
+            Flash::Anchor(_) => FLASH,
+            Flash::Blocks(..) => BLOCK_FLASH,
+        }
+    }
 }
 
 /// Fluid zoom: the layout stays at `committed` while the visual scale animates toward `target`.
@@ -115,8 +137,14 @@ struct App {
     code_fade: Fade,
     code_button_hot: bool,
     copied: Option<(usize, Instant)>,
-    flash: Option<(String, Instant)>,
+    flash: Option<(Flash, Instant)>,
     cursor: CursorKind,
+    /// Window kept above all others (Ctrl+Shift+A).
+    on_top: bool,
+    /// Reading position to restore once the freshly opened file is laid out.
+    pending_anchor: Option<(usize, f32)>,
+    /// The file changed while the view was at its end: stay at the end (like `tail -f`).
+    follow_bottom: bool,
     tracking_leave: bool,
     dpi: u32,
     startup: Option<Instant>,
@@ -143,21 +171,60 @@ struct Find {
     theme_gen: u64,
 }
 
+/// Picker rows: "Follow Windows" first (showing both halves of its light/dark pair), then every theme.
 fn switcher_entries(themes: &ThemeSet) -> Vec<SwitcherEntry> {
-    themes
-        .themes
-        .iter()
-        .map(|t| {
+    let half = |id: &str| themes.index_of(id).map(|i| themes.themes[i].palette());
+    let (light, dark) = (half(&themes.light), half(&themes.dark));
+    let swatch = |p: &Option<Palette>, f: fn(&Palette) -> crate::theme::Rgba| p.as_ref().map_or(crate::theme::Rgba { r: 0.5, g: 0.5, b: 0.5, a: 1.0 }, f);
+    let follow = SwitcherEntry {
+        name: "Follow Windows".into(),
+        swatches: [swatch(&light, |p| p.background), swatch(&light, |p| p.headings[0]), swatch(&dark, |p| p.background), swatch(&dark, |p| p.headings[0])],
+    };
+    std::iter::once(follow)
+        .chain(themes.themes.iter().map(|t| {
             let p = t.palette();
             SwitcherEntry { name: t.name.clone(), swatches: [p.background, p.headings[0], p.headings[1], p.headings[2]] }
+        }))
+        .collect()
+}
+
+/// One hash per block, to find what a reload changed.
+fn block_signatures(doc: &Document) -> Vec<u64> {
+    doc.blocks
+        .iter()
+        .map(|b| {
+            let mut h = DefaultHasher::new();
+            b.hash(&mut h);
+            h.finish()
         })
         .collect()
+}
+
+/// The range of blocks in `new` that differ from `old`: everything between the common prefix
+/// and the common suffix. A pure deletion highlights the block where it happened.
+fn changed_range(old: &[u64], new: &[u64]) -> Option<(usize, usize)> {
+    if new.is_empty() || old == new {
+        return None;
+    }
+    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let max_suffix = old.len().min(new.len()) - prefix;
+    let suffix = old.iter().rev().zip(new.iter().rev()).take(max_suffix).take_while(|(a, b)| a == b).count();
+    let first = prefix.min(new.len() - 1);
+    let last = (new.len() - suffix).saturating_sub(1).max(first);
+    Some((first, last))
+}
+
+/// Key under which a file's reading position is remembered.
+fn position_key(path: &Path) -> String {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy().into_owned()
 }
 
 pub fn run_window_loop(file: Option<PathBuf>, startup_timer: Instant) -> Result<()> {
     unsafe {
         // Enforce Per-Monitor V2 High-DPI awareness
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // COM, for image decoding (WIC) and printing.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
         let instance = GetModuleHandleW(None)?;
         let class_name = w!("WackDown_WindowClass");
@@ -233,6 +300,9 @@ pub fn run_window_loop(file: Option<PathBuf>, startup_timer: Instant) -> Result<
             copied: None,
             flash: None,
             cursor: CursorKind::Arrow,
+            on_top: false,
+            pending_anchor: None,
+            follow_bottom: false,
             tracking_leave: false,
             dpi,
             startup: Some(startup_timer),
@@ -253,6 +323,11 @@ pub fn run_window_loop(file: Option<PathBuf>, startup_timer: Instant) -> Result<
         DragAcceptFiles(hwnd, true);
         SetTimer(hwnd, TIMER_WATCH, 700, None);
         let _ = ShowWindow(hwnd, if placement.is_some_and(|p| p.maximized) { SW_SHOWMAXIMIZED } else { SW_SHOW });
+        if config.always_on_top == Some(true) {
+            if let Some(app) = app_from(hwnd) {
+                app.set_on_top(true);
+            }
+        }
 
         // Frame loop: render while anything moves (each present waits for the display's vertical
         // blank, which paces animation at the monitor's refresh rate), otherwise sleep until input.
@@ -358,27 +433,45 @@ impl App {
         if let Some(f) = self.find.as_mut() {
             f.current = 0;
         }
+        self.pending_anchor = None;
         if !keep_scroll {
             self.scroll.set(0.0);
+            // Pick up where this file was left last time.
+            if let Source::File(path) = &source {
+                self.pending_anchor = Config::load().recent_position(&position_key(path));
+            }
         }
         self.source = source;
         self.update_title();
         self.invalidate();
     }
 
-    fn update_title(&self) {
-        let name = match &self.source {
+    fn document_name(&self) -> String {
+        match &self.source {
             Source::File(path) => path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()),
             Source::Help => "Help".into(),
-        };
-        let title = wide(&format!("{name} — WackDown · {}", self.themes.current().name));
+        }
+    }
+
+    fn update_title(&self) {
+        let pin = if self.on_top { " · always on top" } else { "" };
+        let title = wide(&format!("{} — WackDown · {}{pin}", self.document_name(), self.themes.current().name));
         unsafe {
             let _ = SetWindowTextW(self.hwnd, PCWSTR(title.as_ptr()));
         }
     }
 
+    /// Saves where reading stopped in the current file (restored next time it opens).
+    fn remember_position(&self) {
+        let (Source::File(path), Some(layout)) = (&self.source, self.renderer.layout()) else { return };
+        let (block, frac) = layout.block_at(self.scroll.value);
+        let key = position_key(path);
+        Config::update(|c| c.remember_position(&key, block, frac));
+    }
+
     fn navigate(&mut self, source: Source, fragment: Option<String>) {
         if source != self.source {
+            self.remember_position();
             self.history.push((self.source.clone(), self.scroll.value));
             self.forward.clear();
             self.load(source, false);
@@ -389,17 +482,73 @@ impl App {
 
     fn back(&mut self) {
         if let Some((source, scroll)) = self.history.pop() {
+            self.remember_position();
             self.forward.push((self.source.clone(), self.scroll.value));
             self.load(source, false);
+            self.pending_anchor = None;
             self.scroll.set(scroll);
         }
     }
 
     fn go_forward(&mut self) {
         if let Some((source, scroll)) = self.forward.pop() {
+            self.remember_position();
             self.history.push((self.source.clone(), self.scroll.value));
             self.load(source, false);
+            self.pending_anchor = None;
             self.scroll.set(scroll);
+        }
+    }
+
+    /// Re-reads the current file after it changed on disk (or F5): the blocks that changed are
+    /// highlighted, and a view that was at the end stays at the end as the file grows.
+    fn refresh_document(&mut self) {
+        let line = self.line_height();
+        let max = self.max_scroll();
+        let at_bottom = self.renderer.layout().is_some_and(|l| l.complete) && max > 0.0 && self.scroll.target >= max - line * 2.0;
+        let old = block_signatures(&self.doc);
+        self.load(self.source.clone(), true);
+        let new = block_signatures(&self.doc);
+        if let Some((first, last)) = changed_range(&old, &new) {
+            self.flash = Some((Flash::Blocks(first, last), Instant::now()));
+        }
+        self.follow_bottom = at_bottom;
+    }
+
+    /// Keeps the window above all others, or stops doing so. Remembered across runs.
+    fn set_on_top(&mut self, on: bool) {
+        self.on_top = on;
+        unsafe {
+            let _ = SetWindowPos(self.hwnd, if on { HWND_TOPMOST } else { HWND_NOTOPMOST }, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        Config::update(|c| c.always_on_top = on.then_some(true));
+        self.update_title();
+        self.invalidate();
+    }
+
+    /// Ctrl+P: the Windows print dialog, then the document on paper or in a PDF. Dark themes
+    /// print with the grayscale light theme.
+    fn print(&mut self) {
+        let theme = self.themes.print_theme().clone();
+        let pal = theme.palette();
+        let title = self.document_name();
+        if let Err(e) = self.renderer.print(self.hwnd, &self.doc, &theme, &pal, &title) {
+            eprintln!("[WackDown] print failed: {e:?}");
+            let text = wide(&format!("Printing failed.\n\n{e}"));
+            unsafe {
+                MessageBoxW(self.hwnd, PCWSTR(text.as_ptr()), w!("WackDown"), MB_OK | MB_ICONWARNING);
+            }
+        }
+        self.invalidate();
+    }
+
+    /// Windows switched between light and dark mode: follow it if asked to.
+    fn on_system_colors_changed(&mut self) {
+        if self.themes.apply_system() {
+            let view = ViewState { scroll: self.scroll.value.round(), selection: self.ordered_selection(), ..Default::default() };
+            let _ = self.renderer.begin_crossfade(&self.palette, &view);
+            self.measure_next = true;
+            self.on_theme_changed();
         }
     }
 
@@ -518,6 +667,8 @@ impl App {
         const HELP: usize = 6;
         const OPEN_LINK: usize = 7;
         const COPY_LINK: usize = 8;
+        const PRINT: usize = 9;
+        const ON_TOP: usize = 10;
         let (dx, dy) = self.to_doc(x, y);
         let link = self.renderer.layout().and_then(|l| l.link_at(dx, dy)).map(str::to_string);
         let has_selection = self.ordered_selection().is_some();
@@ -537,7 +688,9 @@ impl App {
             add(MF_SEPARATOR, 0, "");
             add(MF_STRING, FIND, "Find in page…\tCtrl+F");
             add(MF_STRING, OPEN, "Open file…\tCtrl+O");
+            add(MF_STRING, PRINT, "Print…\tCtrl+P");
             add(MF_STRING, THEMES, "Themes…\tCtrl+T");
+            add(if self.on_top { MF_STRING | MF_CHECKED } else { MF_STRING }, ON_TOP, "Always on top\tCtrl+Shift+A");
             add(MF_SEPARATOR, 0, "");
             add(MF_STRING, HELP, "Help\tF1");
             // Open where the click (or caret) is, in screen pixels.
@@ -557,7 +710,9 @@ impl App {
             }
             FIND => self.open_find(),
             OPEN => self.open_dialog(),
+            PRINT => self.print(),
             THEMES => self.toggle_switcher(),
+            ON_TOP => self.set_on_top(!self.on_top),
             HELP => self.navigate(Source::Help, None),
             OPEN_LINK => {
                 if let Some(url) = link {
@@ -593,13 +748,15 @@ impl App {
     fn reload(&mut self) {
         let current = self.themes.current().id.clone();
         self.themes = ThemeSet::load();
-        if let Some(i) = self.themes.themes.iter().position(|t| t.id == current) {
-            self.themes.current = i;
+        if !self.themes.follow {
+            if let Some(i) = self.themes.index_of(&current) {
+                self.themes.current = i;
+            }
         }
         self.switcher_entries = switcher_entries(&self.themes);
         self.switcher = None;
         self.on_theme_changed();
-        self.load(self.source.clone(), true);
+        self.refresh_document();
     }
 
     fn on_theme_changed(&mut self) {
@@ -610,14 +767,37 @@ impl App {
         self.invalidate();
     }
 
-    /// Switches theme with a crossfade from the current frame. `persist` remembers the choice.
+    /// Switches to a theme by index, with a crossfade from the current frame (and leaves
+    /// follow-Windows mode). `persist` remembers the choice.
     fn apply_theme(&mut self, index: usize, persist: bool) {
-        if index != self.themes.current && index < self.themes.themes.len() {
+        self.apply_row(index + 1, persist);
+    }
+
+    /// Picker rows: 0 is "Follow Windows", row `i + 1` is theme `i`.
+    fn switcher_rows(&self) -> usize {
+        self.themes.themes.len() + 1
+    }
+
+    fn selected_row(&self) -> usize {
+        if self.themes.follow { 0 } else { self.themes.current + 1 }
+    }
+
+    fn apply_row(&mut self, row: usize, persist: bool) {
+        if row < self.switcher_rows() {
             let view = ViewState { scroll: self.scroll.value.round(), selection: self.ordered_selection(), ..Default::default() };
-            let _ = self.renderer.begin_crossfade(&self.palette, &view);
-            self.themes.current = index;
-            self.measure_next = true;
-            self.on_theme_changed();
+            let before = self.themes.current;
+            if row == 0 {
+                self.themes.set_follow();
+            } else {
+                self.themes.select(row - 1);
+            }
+            if self.themes.current != before {
+                let _ = self.renderer.begin_crossfade(&self.palette, &view);
+                self.measure_next = true;
+                self.on_theme_changed();
+            }
+            self.switcher_entries = switcher_entries(&self.themes);
+            self.invalidate();
         }
         if persist {
             self.themes.save();
@@ -628,7 +808,7 @@ impl App {
         match self.switcher {
             Some(_) => self.close_switcher(true),
             None => {
-                self.switcher = Some(Switcher { original: self.themes.current, hover: None });
+                self.switcher = Some(Switcher { original: self.themes.current, original_follow: self.themes.follow, hover: None });
                 self.invalidate();
             }
         }
@@ -638,21 +818,24 @@ impl App {
         let Some(sw) = self.switcher.take() else { return };
         if keep {
             self.themes.save();
+        } else if sw.original_follow {
+            self.apply_row(0, false);
         } else {
-            self.apply_theme(sw.original, false);
+            self.apply_row(sw.original + 1, false);
         }
         self.invalidate();
     }
 
     fn switcher_key(&mut self, vk: VIRTUAL_KEY, shift: bool) -> bool {
-        let n = self.themes.themes.len();
+        let n = self.switcher_rows();
+        let row = self.selected_row();
         let step = |cur: usize, forward: bool| if forward { (cur + 1) % n } else { (cur + n - 1) % n };
         match vk {
-            VK_UP => self.apply_theme(step(self.themes.current, false), false),
-            VK_DOWN => self.apply_theme(step(self.themes.current, true), false),
-            VK_TAB | VK_T => self.apply_theme(step(self.themes.current, !shift), false),
-            VK_HOME => self.apply_theme(0, false),
-            VK_END => self.apply_theme(n - 1, false),
+            VK_UP => self.apply_row(step(row, false), false),
+            VK_DOWN => self.apply_row(step(row, true), false),
+            VK_TAB | VK_T => self.apply_row(step(row, !shift), false),
+            VK_HOME => self.apply_row(0, false),
+            VK_END => self.apply_row(n - 1, false),
             VK_RETURN => self.close_switcher(true),
             VK_ESCAPE => self.close_switcher(false),
             _ => return false,
@@ -678,7 +861,12 @@ impl App {
         let (_, vh) = self.view_size();
         let visible = self.visible_height();
         let prior_anchor = self.renderer.layout().map(|l| l.block_at(self.scroll.value));
-        let need_block = self.zoom_anchor.map(|(a, _, _)| a.0).or(prior_anchor.map(|a| a.0)).unwrap_or(0);
+        let need_block = self
+            .zoom_anchor
+            .map(|(a, _, _)| a.0)
+            .or(self.pending_anchor.map(|a| a.0))
+            .or(prior_anchor.map(|a| a.0))
+            .unwrap_or(0);
         let scale = self.zoom_transform().map_or(1.0, |(s, _, _)| s);
         let need_y = self.scroll.value.max(self.scroll.target) + visible * 1.5 / scale.min(1.0);
         // A relayout that changes the zoom or the column count gets a crossfade from the old
@@ -723,12 +911,24 @@ impl App {
                 self.scroll.target = y + delta;
             }
         }
+        if fresh && self.laid_doc_gen != self.doc_gen {
+            // A newly opened file: back to where it was left...
+            if let Some(anchor) = self.pending_anchor.take() {
+                let y = self.renderer.layout().map_or(0.0, |l| l.block_y(anchor));
+                self.scroll.set(y.clamp(0.0, self.max_scroll()));
+            }
+            // ...or, for a file that grew while the view was at its end, on to the new end.
+            if std::mem::take(&mut self.follow_bottom) {
+                let _ = self.renderer.finish_layout(&self.doc);
+                self.scroll_to(f32::MAX);
+            }
+        }
         self.laid_doc_gen = self.doc_gen;
         if let Some(fragment) = self.pending_fragment.take() {
             let _ = self.renderer.finish_layout(&self.doc);
             if let Some(y) = self.renderer.layout().and_then(|l| l.anchor_y(&fragment)) {
                 self.scroll.set(y);
-                self.flash = Some((fragment, Instant::now()));
+                self.flash = Some((Flash::Anchor(fragment), Instant::now()));
             }
         }
         self.clamp_scroll();
@@ -796,7 +996,7 @@ impl App {
         self.zoom_note.on = z.visual == z.target && z.committed == z.target && (z.target <= MIN_ZOOM || z.target >= MAX_ZOOM);
         self.zoom_note.step(dt, 5.0);
 
-        if self.flash.as_ref().is_some_and(|(_, t)| t.elapsed() > FLASH) {
+        if self.flash.as_ref().is_some_and(|(f, t)| t.elapsed() > f.duration()) {
             self.flash = None;
         }
         if self.copied.is_some_and(|(_, t)| t.elapsed() > COPIED) {
@@ -839,11 +1039,16 @@ impl App {
         let matches: &[(TextPos, TextPos)] = self.find.as_ref().map_or(&[], |f| &f.matches);
         let status = self.status_text();
 
+        let selected_row = self.selected_row();
         let rows: Vec<(usize, f32)> = self.row_fx.iter().map(|&(r, f)| (r, f.value)).collect();
         let links: Vec<((usize, usize), f32)> = self.link_fx.iter().map(|&(l, f)| (l, f.value)).collect();
-        let flash = self.flash.as_ref().and_then(|(name, t)| {
-            let rect = self.renderer.layout()?.anchor_rect(name)?;
-            let p = t.elapsed().as_secs_f32() / FLASH.as_secs_f32();
+        let flash = self.flash.as_ref().and_then(|(what, t)| {
+            let layout = self.renderer.layout()?;
+            let rect = match what {
+                Flash::Anchor(name) => layout.anchor_rect(name)?,
+                Flash::Blocks(first, last) => layout.blocks_rect(*first, *last)?,
+            };
+            let p = t.elapsed().as_secs_f32() / what.duration().as_secs_f32();
             // Quick fade in, slow fade out.
             let alpha = if p < 0.15 { p / 0.15 } else { 1.0 - ease_out((p - 0.15) / 0.85) };
             Some((rect, alpha))
@@ -868,7 +1073,7 @@ impl App {
             }),
             switcher: self.switcher.as_ref().map(|sw| SwitcherView {
                 entries: &self.switcher_entries,
-                selected: self.themes.current,
+                selected: selected_row,
                 hover: sw.hover,
                 stats: self.switch_stats.clone(),
             }),
@@ -952,11 +1157,15 @@ impl App {
         Some(if a <= b { (a, b) } else { (b, a) })
     }
 
+    /// Copies the selection as plain text and as HTML, so a paste into mail or a document keeps
+    /// headings, lists, links and code.
     fn copy_selection(&self) {
         let (Some(sel), Some(layout)) = (self.ordered_selection(), self.renderer.layout()) else { return };
         let text = layout.selected_text(sel);
         if !text.is_empty() {
-            let _ = set_clipboard_text(self.hwnd, &text);
+            let fragment = html::selection_html(&self.doc, layout, sel);
+            let rich = (!fragment.is_empty()).then(|| html::cf_html(&fragment));
+            let _ = set_clipboard(self.hwnd, &text, rich.as_deref());
         }
     }
 
@@ -970,7 +1179,7 @@ impl App {
             let _ = self.renderer.finish_layout(&self.doc);
             if let Some(y) = self.renderer.layout().and_then(|l| l.anchor_y(fragment)) {
                 self.scroll_to(y);
-                self.flash = Some((fragment.to_string(), Instant::now()));
+                self.flash = Some((Flash::Anchor(fragment.to_string()), Instant::now()));
             }
             return;
         }
@@ -1039,7 +1248,7 @@ impl App {
         if let Source::File(path) = &self.source {
             let now = file_mtime(path);
             if now.is_some() && now != self.mtime {
-                self.load(self.source.clone(), true);
+                self.refresh_document();
             }
         }
     }
@@ -1174,7 +1383,7 @@ impl App {
             let n = self.switcher_entries.len();
             let panel = switcher_rect(vw, n);
             if let Some(row) = switcher_row_at(vw, n, x, y) {
-                self.apply_theme(row, true);
+                self.apply_row(row, true);
                 self.switcher = None;
                 self.invalidate();
             } else if x < panel.left || x > panel.right || y < panel.top || y > panel.bottom {
@@ -1330,6 +1539,8 @@ impl App {
             VK_OEM_MINUS | VK_SUBTRACT if ctrl => self.zoom_step(-1.0, (vw / 2.0, vh / 2.0)),
             VK_0 | VK_NUMPAD0 if ctrl => self.zoom_to(1.0, (vw / 2.0, vh / 2.0)),
             VK_C if ctrl => self.copy_selection(),
+            VK_P if ctrl => self.print(),
+            VK_A if ctrl && shift => self.set_on_top(!self.on_top),
             VK_A if ctrl => {
                 let _ = self.renderer.finish_layout(&self.doc);
                 self.selection = self.renderer.layout().and_then(|l| l.select_all());
@@ -1466,6 +1677,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_SETTINGCHANGE => {
+            app.on_system_colors_changed();
+            LRESULT(0)
+        }
         WM_DROPFILES => {
             let hdrop = HDROP(wparam.0 as *mut _);
             let mut buf = [0u16; 1024];
@@ -1478,6 +1693,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_DESTROY => {
+            app.remember_position();
             app.save_placement();
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             drop(Box::from_raw(app as *mut App));
@@ -1535,32 +1751,6 @@ fn is_markdown(path: &Path) -> bool {
         .is_some_and(|e| matches!(e.as_str(), "md" | "markdown" | "mdown" | "mkd" | "mkdn"))
 }
 
-/// `https:`, `mailto:` etc. A single letter followed by ':' is a drive letter, not a scheme.
-fn has_scheme(url: &str) -> bool {
-    match url.split_once(':') {
-        Some((scheme, _)) => scheme.len() > 1 && scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.'),
-        None => false,
-    }
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 fn shell_open(hwnd: HWND, target: &str) {
     let target = wide(target);
     unsafe {
@@ -1569,20 +1759,37 @@ fn shell_open(hwnd: HWND, target: &str) {
 }
 
 fn set_clipboard_text(hwnd: HWND, text: &str) -> Result<()> {
+    set_clipboard(hwnd, text, None)
+}
+
+/// Puts `text` on the clipboard as CF_UNICODETEXT, plus `html` (a complete "HTML Format"
+/// payload, see `html::cf_html`) when given.
+fn set_clipboard(hwnd: HWND, text: &str, html: Option<&[u8]>) -> Result<()> {
     let data: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
     unsafe {
         OpenClipboard(hwnd)?;
         let result = (|| {
             EmptyClipboard()?;
-            let mem = GlobalAlloc(GMEM_MOVEABLE, data.len() * 2)?;
-            let ptr = GlobalLock(mem) as *mut u16;
-            if ptr.is_null() {
-                return Err(Error::from_win32());
+            let put = |format: u32, bytes: &[u8]| -> Result<()> {
+                let mem = GlobalAlloc(GMEM_MOVEABLE, bytes.len())?;
+                let ptr = GlobalLock(mem) as *mut u8;
+                if ptr.is_null() {
+                    return Err(Error::from_win32());
+                }
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+                let _ = GlobalUnlock(mem);
+                // The clipboard takes ownership of `mem`.
+                SetClipboardData(format, HANDLE(mem.0))?;
+                Ok(())
+            };
+            // CF_UNICODETEXT
+            put(13, std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2))?;
+            if let Some(html) = html {
+                let format = RegisterClipboardFormatW(w!("HTML Format"));
+                if format != 0 {
+                    put(format, html)?;
+                }
             }
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-            let _ = GlobalUnlock(mem);
-            // CF_UNICODETEXT; the clipboard takes ownership of `mem`.
-            SetClipboardData(13, HANDLE(mem.0))?;
             Ok(())
         })();
         let _ = CloseClipboard();
@@ -1603,6 +1810,19 @@ mod tests {
         assert_eq!(percent_decode("my%20file.md"), "my file.md");
         assert_eq!(percent_decode("100%"), "100%");
         assert!(is_markdown(Path::new("x/Y.MD")));
+    }
+
+    #[test]
+    fn reload_diff_finds_the_changed_blocks() {
+        let old = [1, 2, 3, 4, 5];
+        assert_eq!(changed_range(&old, &old), None);
+        assert_eq!(changed_range(&old, &[1, 2, 9, 4, 5]), Some((2, 2)), "one edited block");
+        assert_eq!(changed_range(&old, &[1, 2, 3, 4, 5, 6, 7]), Some((5, 6)), "appended blocks");
+        assert_eq!(changed_range(&old, &[1, 2, 4, 5]), Some((2, 2)), "a deletion highlights where it happened");
+        assert_eq!(changed_range(&old, &[1, 8, 3, 9, 5]), Some((1, 3)), "two edits span the range between them");
+        assert_eq!(changed_range(&old, &[]), None);
+        assert_eq!(changed_range(&[], &[1]), Some((0, 0)));
+        assert_eq!(changed_range(&[1, 1, 1], &[1, 1]), Some((1, 1)), "repeated blocks don't overlap prefix and suffix");
     }
 
     #[test]
