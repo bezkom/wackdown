@@ -64,6 +64,14 @@ const DATA_KW: &[&str] = &["true", "false", "null", "yes", "no", "on", "off", "~
 
 const MARKUP_KW: &[&str] = &[];
 
+/// For a ```mermaid fence the engine couldn't draw (so the source is shown instead).
+const MERMAID_KW: &[&str] = &[
+    "graph", "flowchart", "subgraph", "end", "direction", "classDiagram", "stateDiagram", "stateDiagram-v2", "sequenceDiagram", "pie", "gantt", "erDiagram",
+    "participant", "actor", "loop", "alt", "else", "opt", "par", "and", "critical", "break", "rect", "note", "over", "activate", "deactivate", "autonumber",
+    "title", "class", "state", "namespace", "showData", "style", "classDef", "click", "linkStyle", "gitGraph", "mindmap", "timeline", "journey", "quadrantChart",
+    "xychart-beta", "dateFormat", "axisFormat", "section", "commit", "branch", "checkout", "merge", "cherry-pick", "x-axis", "y-axis", "bar", "line", "box", "excludes",
+];
+
 fn lang_for(tag: &str) -> Option<Lang> {
     let tag = tag.to_ascii_lowercase();
     let c_like = Lang { line_comments: &["//"], block_comment: Some(("/*", "*/")), quotes: "\"'`", keywords: C_LIKE_KW, rust_lifetimes: false };
@@ -86,6 +94,7 @@ fn lang_for(tag: &str) -> Option<Lang> {
             Lang { line_comments: &[], block_comment: Some(("<!--", "-->")), quotes: "\"'", keywords: MARKUP_KW, rust_lifetimes: false }
         }
         "css" | "scss" | "less" => Lang { line_comments: &["//"], block_comment: Some(("/*", "*/")), quotes: "\"'", keywords: MARKUP_KW, rust_lifetimes: false },
+        "mermaid" => Lang { line_comments: &["%%"], block_comment: None, quotes: "\"", keywords: MERMAID_KW, rust_lifetimes: false },
         _ => c_like,
     })
 }

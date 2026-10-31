@@ -11,6 +11,7 @@ mod highlight;
 mod html;
 mod images;
 mod layout;
+mod mermaid;
 mod parser;
 mod print;
 mod renderer;

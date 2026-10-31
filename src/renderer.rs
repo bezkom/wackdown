@@ -15,7 +15,7 @@ use windows::Win32::System::Com::IStream;
 use crate::fonts::Fonts;
 use crate::gpu::{client_size, Gpu};
 use crate::images::ImageCache;
-use crate::layout::{color_f, get_brush, make_format, range_rects, Deco, Faces, Layout, LayoutBuilder, TextPos, SCROLLBAR_HIT_WIDTH};
+use crate::layout::{color_f, get_brush, make_format, range_rects, Deco, DiagramOp, Faces, Layout, LayoutBuilder, TextPos, SCROLLBAR_HIT_WIDTH};
 use crate::parser::{Callout, Document};
 use crate::print::{choose_printer, PrinterChoice};
 use crate::theme::{Palette, Rgba, WackDownTheme};
@@ -114,7 +114,7 @@ pub struct Renderer {
     fonts: Fonts,
     gpu: Option<Gpu>,
     brushes: HashMap<u32, ID2D1SolidColorBrush>,
-    round_stroke: Option<ID2D1StrokeStyle>,
+    strokes: Strokes,
     dpi: f32,
     layout: Option<Layout>,
     builder: Option<LayoutBuilder>,
@@ -139,7 +139,7 @@ impl Renderer {
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let fonts = Fonts::new(&dwrite)?;
             let base: ID2D1Factory = factory.cast()?;
-            let round_stroke = base
+            let round = base
                 .CreateStrokeStyle(
                     &D2D1_STROKE_STYLE_PROPERTIES {
                         startCap: D2D1_CAP_STYLE_ROUND,
@@ -150,6 +150,10 @@ impl Renderer {
                     None,
                 )
                 .ok();
+            // Dash lengths are in stroke-width units, so dashed diagram edges scale with zoom.
+            let dash = base
+                .CreateStrokeStyle(&D2D1_STROKE_STYLE_PROPERTIES { dashStyle: D2D1_DASH_STYLE_DASH, lineJoin: D2D1_LINE_JOIN_ROUND, ..Default::default() }, None)
+                .ok();
             Ok(Self {
                 hwnd,
                 factory,
@@ -157,7 +161,7 @@ impl Renderer {
                 fonts,
                 gpu: None,
                 brushes: HashMap::new(),
-                round_stroke,
+                strokes: Strokes { round, dash },
                 dpi: dpi as f32,
                 layout: None,
                 builder: None,
@@ -475,7 +479,7 @@ impl Renderer {
         let breaks = layout.page_breaks(content_h);
         let pages = breaks.len();
 
-        let (factory, dwrite, round_stroke) = (self.factory.clone(), self.dwrite.clone(), self.round_stroke.clone());
+        let (factory, dwrite, strokes) = (self.factory.clone(), self.dwrite.clone(), self.strokes.clone());
         let old_target = unsafe { dc.GetTarget().ok() };
         let result = (|| -> Result<()> {
             for (i, &top) in breaks.iter().enumerate() {
@@ -490,7 +494,7 @@ impl Renderer {
                     let end = breaks.get(i + 1).map_or(page_h - margin_y, |next| margin_y + (next - top)).min(page_h - margin_y);
                     let clip = D2D_RECT_F { left: 0.0, top: margin_y - 2.0, right: page_w, bottom: end + 2.0 };
                     target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
-                    let drawn = draw_scene(&target, &mut brushes, &factory, &dwrite, &ui, Some(&layout), round_stroke.as_ref(), pal, &view, page_w, page_h);
+                    let drawn = draw_scene(&target, &mut brushes, &factory, &dwrite, &ui, Some(&layout), &strokes, pal, &view, page_w, page_h);
                     target.PopAxisAlignedClip();
                     drawn?;
                     draw_page_footer(&target, &mut brushes, &dwrite, &ui, pal, title, i + 1, pages, page_w, page_h, margin_y)?;
@@ -528,8 +532,8 @@ impl Renderer {
 
     fn draw_document(&mut self, dc: &ID2D1RenderTarget, pal: &Palette, view: &ViewState, vw: f32, vh: f32) -> Result<()> {
         let ui = self.ui_formats()?;
-        let Self { brushes, layout, round_stroke, factory, dwrite, .. } = self;
-        draw_scene(dc, brushes, factory, dwrite, &ui, layout.as_ref(), round_stroke.as_ref(), pal, view, vw, vh)
+        let Self { brushes, layout, strokes, factory, dwrite, .. } = self;
+        draw_scene(dc, brushes, factory, dwrite, &ui, layout.as_ref(), strokes, pal, view, vw, vh)
     }
 
     /// Captures the current frame so the next ones can crossfade from it (theme switches).
@@ -594,7 +598,7 @@ fn draw_scene(
     dwrite: &IDWriteFactory,
     ui: &UiFormats,
     layout: Option<&Layout>,
-    round_stroke: Option<&ID2D1StrokeStyle>,
+    strokes: &Strokes,
     pal: &Palette,
     view: &ViewState,
     vw: f32,
@@ -651,14 +655,24 @@ fn draw_scene(
                     let p2 = pt(r.left + w * 0.42, r.top + h * 0.72);
                     let p3 = pt(r.left + w * 0.78, r.top + h * 0.3);
                     let b = brush(*color)?;
-                    dc.DrawLine(p1, p2, &b, *width, round_stroke);
-                    dc.DrawLine(p2, p3, &b, *width, round_stroke);
+                    dc.DrawLine(p1, p2, &b, *width, strokes.round.as_ref());
+                    dc.DrawLine(p2, p3, &b, *width, strokes.round.as_ref());
                 }
                 Deco::Icon { kind, cx, cy, size, color } => {
-                    draw_icon(dc, factory, *kind, *cx, *cy + dy, *size, &brush(*color)?, round_stroke)?;
+                    draw_icon(dc, factory, *kind, *cx, *cy + dy, *size, &brush(*color)?, strokes.round.as_ref())?;
                 }
                 Deco::Image { bitmap, rect } => {
                     dc.DrawBitmap(bitmap, Some(&offset(*rect, dy)), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                }
+                Deco::Diagram { rect, ops } => {
+                    // Ops are in diagram-local coordinates: translate on top of whatever
+                    // column/zoom transform is current, then put it back.
+                    let mut base = Matrix3x2::default();
+                    dc.GetTransform(&mut base);
+                    dc.SetTransform(&translated(&base, rect.left, rect.top + dy));
+                    let drawn = draw_diagram(dc, &mut brush, ops, strokes);
+                    dc.SetTransform(&base);
+                    drawn?;
                 }
             }
         }
@@ -834,6 +848,62 @@ fn edge_fade(dc: &ID2D1RenderTarget, color: Rgba, from: f32, to: f32, top: f32, 
         let brush = dc.CreateLinearGradientBrush(&props, None, &collection)?;
         let r = D2D_RECT_F { left: from.min(to), top, right: from.max(to), bottom };
         dc.FillRectangle(&r, &brush);
+    }
+    Ok(())
+}
+
+/// Stroke styles created once: round caps for icons and check marks, dashes for diagram edges.
+#[derive(Clone)]
+pub(crate) struct Strokes {
+    pub round: Option<ID2D1StrokeStyle>,
+    pub dash: Option<ID2D1StrokeStyle>,
+}
+
+/// `base` with a translation applied first (diagram-local → document → view).
+fn translated(base: &Matrix3x2, dx: f32, dy: f32) -> Matrix3x2 {
+    Matrix3x2 { M31: dx * base.M11 + dy * base.M21 + base.M31, M32: dx * base.M12 + dy * base.M22 + base.M32, ..*base }
+}
+
+/// Draws a diagram's ops in the current transform: fill first, then outline.
+fn draw_diagram(dc: &ID2D1RenderTarget, brush: &mut dyn FnMut(Rgba) -> Result<ID2D1SolidColorBrush>, ops: &[DiagramOp], strokes: &Strokes) -> Result<()> {
+    let style = |dashed: bool| if dashed { strokes.dash.as_ref() } else { strokes.round.as_ref() };
+    unsafe {
+        for op in ops {
+            match op {
+                DiagramOp::Rect { rect, radius, fill, stroke } => {
+                    if let Some(c) = fill {
+                        if *radius > 0.0 {
+                            dc.FillRoundedRectangle(&rounded(*rect, *radius), &brush(*c)?);
+                        } else {
+                            dc.FillRectangle(rect, &brush(*c)?);
+                        }
+                    }
+                    if let Some((c, w, dashed)) = stroke {
+                        if *radius > 0.0 {
+                            dc.DrawRoundedRectangle(&rounded(*rect, *radius), &brush(*c)?, *w, style(*dashed));
+                        } else {
+                            dc.DrawRectangle(rect, &brush(*c)?, *w, style(*dashed));
+                        }
+                    }
+                }
+                DiagramOp::Ellipse { ellipse, fill, stroke } => {
+                    if let Some(c) = fill {
+                        dc.FillEllipse(ellipse, &brush(*c)?);
+                    }
+                    if let Some((c, w, dashed)) = stroke {
+                        dc.DrawEllipse(ellipse, &brush(*c)?, *w, style(*dashed));
+                    }
+                }
+                DiagramOp::Path { geometry, fill, stroke } => {
+                    if let Some(c) = fill {
+                        dc.FillGeometry(geometry, &brush(*c)?, None);
+                    }
+                    if let Some((c, w, dashed)) = stroke {
+                        dc.DrawGeometry(geometry, &brush(*c)?, *w, style(*dashed));
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }

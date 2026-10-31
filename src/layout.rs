@@ -18,6 +18,7 @@ use windows::Win32::Graphics::DirectWrite::*;
 use crate::fonts::FontChoice;
 use crate::highlight::{self, Token};
 use crate::images::ImageCache;
+use crate::mermaid::{self, DiagramColors, FontKind, LayoutParams, Seg, Shape, Stroke, TextRun, TextStyle};
 use crate::parser::{percent_decode, Align, Block, BlockKind, Callout, Document, InlineText, ListMarker, Quote, Run, Style};
 use crate::theme::{Palette, Rgba, WackDownTheme};
 
@@ -71,6 +72,17 @@ pub(crate) enum Deco {
     Check { rect: D2D_RECT_F, color: Rgba, width: f32 },
     Icon { kind: Callout, cx: f32, cy: f32, size: f32, color: Rgba },
     Image { bitmap: ID2D1Bitmap, rect: D2D_RECT_F },
+    /// A Mermaid diagram: `ops` are in diagram-local coordinates, drawn translated to `rect`.
+    Diagram { rect: D2D_RECT_F, ops: Vec<DiagramOp> },
+}
+
+/// One drawing step of a diagram. Geometry is built at layout time (it is a device-independent
+/// factory resource, like a text layout), so scrolling frames allocate nothing.
+pub(crate) enum DiagramOp {
+    Rect { rect: D2D_RECT_F, radius: f32, fill: Option<Rgba>, stroke: Option<(Rgba, f32, bool)> },
+    Ellipse { ellipse: D2D1_ELLIPSE, fill: Option<Rgba>, stroke: Option<(Rgba, f32, bool)> },
+    /// `stroke` is (color, width, dashed).
+    Path { geometry: ID2D1PathGeometry, fill: Option<Rgba>, stroke: Option<(Rgba, f32, bool)> },
 }
 
 pub(crate) struct DecoItem {
@@ -90,6 +102,8 @@ pub struct CodeBox {
     pub content_w: f32,
     pub scroll_x: f32,
     pub pad: f32,
+    /// What the Copy button copies when it isn't the item's text: a drawn diagram's source.
+    pub source: Option<String>,
 }
 
 impl CodeBox {
@@ -413,8 +427,12 @@ impl Layout {
 
     /// A code block's text with CRLF line endings, for the clipboard.
     pub fn code_text(&self, code: usize) -> Option<String> {
-        let item = &self.items[self.codes.get(code)?.item];
-        Some(String::from_utf16_lossy(&item.text).replace('\n', "\r\n"))
+        let c = self.codes.get(code)?;
+        let text = match &c.source {
+            Some(s) => s.clone(),
+            None => String::from_utf16_lossy(&self.items.get(c.item)?.text),
+        };
+        Some(text.replace('\n', "\r\n"))
     }
 
     /// Expands a caret position to the surrounding word (for double-click).
@@ -480,7 +498,8 @@ pub(crate) struct Faces {
 fn weight(block: &Block) -> f64 {
     let units = match &block.kind {
         BlockKind::Heading { text, .. } | BlockKind::Paragraph(text) | BlockKind::ListItem { text, .. } => text.text.len(),
-        BlockKind::Code { code, .. } => code.len() + 40 * code.lines().count(),
+        // Diagrams are taller than their source.
+        BlockKind::Code { lang, code } => code.len() + 40 * code.lines().count() + if lang.eq_ignore_ascii_case("mermaid") { 400 } else { 0 },
         BlockKind::Html(h) => h.len(),
         BlockKind::Table { rows, .. } => rows.iter().flatten().map(|c| c.text.len() + 20).sum(),
         BlockKind::DefinitionTerm(text) => text.text.len(),
@@ -810,6 +829,7 @@ impl LayoutBuilder {
                 };
                 h + 2.0 * pad
             }
+            BlockKind::Code { lang, code } if lang.eq_ignore_ascii_case("mermaid") => self.diagram(layout, brushes, code, x, w, breakout, sep)?,
             BlockKind::Code { lang, code } => self.code_block(layout, brushes, lang, code, x, w, breakout, sep)?,
             BlockKind::Html(html) => {
                 let text = InlineText { text: html.encode_utf16().collect(), ..Default::default() };
@@ -1054,6 +1074,108 @@ impl LayoutBuilder {
         self.inline(layout, brushes, &inline, &self.body.clone(), self.pal.text_dim, x, w, sep, DWRITE_TEXT_ALIGNMENT_LEADING)
     }
 
+    /// A ```mermaid fence: drawn as a diagram, scaled down uniformly to fit the column (never
+    /// enlarged, like a picture) and centered. Labels are ordinary text items so they can be
+    /// selected, searched and copied; the hover Copy button copies the source. Anything the
+    /// engine rejects is shown as the code block it is.
+    ///
+    /// No cache: parse and layout take microseconds and a relayout rebuilds the whole document
+    /// anyway. If profiling ever disagrees, a `HashMap<u64, Diagram>` keyed by the source hash
+    /// next to `Renderer::images` is the place.
+    #[allow(clippy::too_many_arguments)]
+    fn diagram(
+        &mut self,
+        layout: &mut Layout,
+        brushes: &mut HashMap<u32, ID2D1SolidColorBrush>,
+        source: &str,
+        x: f32,
+        w: f32,
+        breakout: bool,
+        sep: Sep,
+    ) -> Result<f32> {
+        let Ok(d) = mermaid::parse(source) else { return self.code_block(layout, brushes, "mermaid", source, x, w, breakout, sep) };
+        let params = LayoutParams { z: self.z, fs: self.fs * 0.92, colors: DiagramColors::from_palette(&self.pal) };
+        let dwrite = self.dwrite.clone();
+        let faces = &self.faces;
+        let mut formats: HashMap<(u32, bool, bool), IDWriteTextFormat> = HashMap::new();
+        let scene = {
+            // Edge labels repeat a lot; measure each distinct (text, style) once.
+            let mut memo: HashMap<(String, u32, bool, bool, bool), (f32, f32)> = HashMap::new();
+            let mut measure = |text: &str, style: &TextStyle| -> (f32, f32) {
+                let key = (text.to_owned(), style.size.to_bits(), style.bold, style.italic, style.font == FontKind::Code);
+                if let Some(&m) = memo.get(&key) {
+                    return m;
+                }
+                let m = match diagram_text_layout(&dwrite, faces, &mut formats, text, *style, 1.0e6) {
+                    Ok(tl) => {
+                        let m = metrics(&tl);
+                        (m.widthIncludingTrailingWhitespace, m.height)
+                    }
+                    Err(_) => (0.0, 0.0),
+                };
+                memo.insert(key, m);
+                m
+            };
+            mermaid::layout(&d, &params, &mut measure)
+        };
+        let Ok(mut scene) = scene else { return self.code_block(layout, brushes, "mermaid", source, x, w, breakout, sep) };
+
+        let (x, w) = self.widen(x, w, scene.width, breakout, (self.wide_left, self.wide_right));
+        if scene.width > w {
+            scene.scale(w / scene.width);
+        }
+        let left = x + (w - scene.width) / 2.0;
+        let top = self.y;
+        let rect = D2D_RECT_F { left, top, right: left + scene.width, bottom: top + scene.height };
+        let factory = unsafe { self.target.GetFactory()? };
+        let ops = scene.shapes.iter().filter_map(|s| diagram_op(&factory, s).ok().flatten()).collect();
+        push(&mut layout.decos, rect.top, rect.bottom, Deco::Diagram { rect, ops });
+
+        // Items must stay sorted by their bottom edge: that is what the layout's binary searches
+        // partition on.
+        let mut texts: Vec<&TextRun> = scene.texts.iter().collect();
+        texts.sort_by(|a, b| (a.y + a.h).total_cmp(&(b.y + b.h)).then(a.x.total_cmp(&b.x)));
+        let first_item = layout.items.len();
+        for (i, t) in texts.iter().enumerate() {
+            let tl = diagram_text_layout(&dwrite, faces, &mut formats, &t.text, t.style, t.w.max(1.0))?;
+            let align = match t.align {
+                mermaid::Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
+                mermaid::Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
+                mermaid::Align::Right => DWRITE_TEXT_ALIGNMENT_TRAILING,
+            };
+            unsafe { tl.SetTextAlignment(align)? };
+            let h = metrics(&tl).height;
+            layout.items.push(TextItem {
+                layout: tl,
+                x: left + t.x,
+                y: top + t.y,
+                w: t.w.max(1.0),
+                h,
+                text: t.text.encode_utf16().collect(),
+                sep: if i == 0 { sep } else { Sep::Line },
+                links: Vec::new(),
+                color: t.color,
+                code: None,
+                block: self.next,
+            });
+        }
+
+        // Hover chrome: the same Copy button as a code block, copying the source. With no
+        // content width there is nothing to scroll, so the fades and the scroll indicator stay off.
+        let m = self.fs * 0.5;
+        layout.codes.push(CodeBox {
+            rect: D2D_RECT_F { left: rect.left - m, top: rect.top - m, right: rect.right + m, bottom: rect.bottom + m },
+            clip_left: rect.left,
+            clip_right: rect.right,
+            item: first_item,
+            content_w: 0.0,
+            scroll_x: 0.0,
+            pad: 0.0,
+            source: Some(source.to_owned()),
+        });
+        Ok(scene.height)
+    }
+
     fn marker(&mut self, layout: &mut Layout, marker: &ListMarker, indent: u16, x: f32, top: f32) -> Result<()> {
         let (label, format, color) = match marker {
             ListMarker::Task(checked) => {
@@ -1153,6 +1275,7 @@ impl LayoutBuilder {
             content_w: m.widthIncludingTrailingWhitespace,
             scroll_x: 0.0,
             pad,
+            source: None,
         });
         layout.items.push(TextItem {
             layout: tl,
@@ -1448,6 +1571,75 @@ pub(crate) fn make_format(dwrite: &IDWriteFactory, font: &FontChoice, size: f32,
         format.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, line, baseline)?;
         Ok(format)
     }
+}
+
+/// Text layout for a diagram label: body or code face, bold/italic, no wrapping. Formats are
+/// cached per (size, bold, mono) for the duration of one diagram.
+fn diagram_text_layout(
+    dwrite: &IDWriteFactory,
+    faces: &Faces,
+    formats: &mut HashMap<(u32, bool, bool), IDWriteTextFormat>,
+    text: &str,
+    style: TextStyle,
+    max_w: f32,
+) -> Result<IDWriteTextLayout> {
+    let size = if style.size.is_finite() { style.size.clamp(1.0, 2000.0) } else { 1.0 };
+    let mono = style.font == FontKind::Code;
+    let face = if mono { &faces.code } else { &faces.body };
+    let key = (size.to_bits(), style.bold, mono);
+    let format = match formats.get(&key) {
+        Some(f) => f.clone(),
+        None => {
+            let line = size * 1.3;
+            let f = make_format(dwrite, face, size, style.bold, line, face.metrics.baseline(size, line))?;
+            formats.insert(key, f.clone());
+            f
+        }
+    };
+    let units: Vec<u16> = text.encode_utf16().collect();
+    unsafe {
+        let tl = dwrite.CreateTextLayout(&units, &format, max_w.max(1.0), 1.0e7)?;
+        tl.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+        if style.italic {
+            tl.SetFontStyle(DWRITE_FONT_STYLE_ITALIC, DWRITE_TEXT_RANGE { startPosition: 0, length: units.len() as u32 })?;
+        }
+        Ok(tl)
+    }
+}
+
+/// One drawable op for a scene shape; `None` for a path with nothing in it.
+fn diagram_op(factory: &ID2D1Factory, shape: &Shape) -> Result<Option<DiagramOp>> {
+    let st = |s: Option<Stroke>| s.map(|s| (s.color, s.width.max(0.5), s.dashed));
+    let p = |p: mermaid::scene::Pt| D2D_POINT_2F { x: p.x, y: p.y };
+    Ok(Some(match shape {
+        Shape::Rect { rect, radius, fill, stroke } => DiagramOp::Rect {
+            rect: D2D_RECT_F { left: rect.x, top: rect.y, right: rect.right(), bottom: rect.bottom() },
+            radius: *radius,
+            fill: *fill,
+            stroke: st(*stroke),
+        },
+        Shape::Ellipse { center, rx, ry, fill, stroke } => DiagramOp::Ellipse { ellipse: D2D1_ELLIPSE { point: p(*center), radiusX: *rx, radiusY: *ry }, fill: *fill, stroke: st(*stroke) },
+        Shape::Path { start, segs, closed, fill, stroke } => {
+            if segs.is_empty() {
+                return Ok(None);
+            }
+            let geometry = unsafe {
+                let geom = factory.CreatePathGeometry()?;
+                let sink = geom.Open()?;
+                sink.BeginFigure(p(*start), if fill.is_some() { D2D1_FIGURE_BEGIN_FILLED } else { D2D1_FIGURE_BEGIN_HOLLOW });
+                for seg in segs {
+                    match *seg {
+                        Seg::Line(to) => sink.AddLine(p(to)),
+                        Seg::Cubic(a, b, c) => sink.AddBezier(&D2D1_BEZIER_SEGMENT { point1: p(a), point2: p(b), point3: p(c) }),
+                    }
+                }
+                sink.EndFigure(if *closed { D2D1_FIGURE_END_CLOSED } else { D2D1_FIGURE_END_OPEN });
+                sink.Close()?;
+                geom
+            };
+            DiagramOp::Path { geometry, fill: *fill, stroke: st(*stroke) }
+        }
+    }))
 }
 
 /// Average advance per character of `sample` in `format`.

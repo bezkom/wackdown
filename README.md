@@ -92,6 +92,7 @@ Further extensions:
 | Sub/superscript | `H~2~O`, `2^10^` | Works inside words. Uses real Unicode characters (H₂O, 2¹⁰) where they exist, smaller text otherwise. |
 | Wiki links | `[[Page]]`, `[[Page\|label]]`, `[[Page#Heading]]` | Opens `Page.md` (or `Page.markdown`) next to the current file. |
 | Math | `$x^2$`, `$$\sum_{i=1}^n x_i$$` | See below. |
+| Mermaid diagrams | ```` ```mermaid ```` fences | Flowchart, sequence, class, state, ER, Gantt, git graph, mind map, timeline, journey, quadrant, XY and pie. See below. |
 
 > [!NOTE]
 > **Single tildes mean subscript.** `~text~` is subscript (Pandoc style), so `H~2~O` works. GitHub
@@ -110,7 +111,23 @@ at 100%. Paths resolve relative to the document. A picture that can't be read sh
 images inside a sentence and images fetched over a network stay alt text, since ƜackDown has no
 network code.
 
-Not supported: Mermaid diagrams render as code blocks.
+**Diagrams.** A ```` ```mermaid ```` fence is drawn natively: flowcharts (`graph` / `flowchart`, every
+node shape including the `A@{ shape: cyl, label: "…" }` syntax, labelled edges in the three line
+styles plus invisible `~~~` links, nested subgraphs with their own `direction`, `style` / `classDef`
+colours), sequence diagrams (participants and actors, every arrow, activations, notes, `loop` / `alt` /
+`opt` / `par` / `critical` / `break` frames, autonumbering, `box` groups), class diagrams
+(compartments, generics, annotations, every relation with multiplicities, namespaces), state diagrams
+(start and end markers, composite states, choice, fork and join), entity relationship diagrams
+(attributes with keys, crow's foot cardinalities), Gantt charts (date formats, durations, `after`,
+sections, milestones, `excludes weekends`), git graphs (branches, merges, cherry-picks, tags),
+mind maps, timelines, user journeys, quadrant charts, XY charts and pie charts. There is no browser
+and no JavaScript in this: a hand-written parser and layout engine (a layered, Sugiyama-style layout
+for graphs) draw with Direct2D, set labels in the document's own fonts, colour everything from the
+theme and scale a diagram down to fit the column. Labels are selectable and searchable, diagrams
+print as vector graphics, and hovering one shows a **Copy** button for the source. Whatever the
+engine doesn't understand (the remaining diagram types such as Sankey, C4, block or architecture
+diagrams, icon and image nodes, a syntax error) is shown as the code block it is, so nothing is ever
+lost.
 
 ## Usage
 | Action | Keys |
@@ -119,7 +136,7 @@ Not supported: Mermaid diagrams render as code blocks.
 | Top / bottom | `Home` / `End` |
 | Zoom (fluid, centered on the cursor; 4% to 5000%) | `Ctrl` + wheel, `Ctrl +` / `Ctrl -`, reset with `Ctrl 0` |
 | Scroll a wide code block sideways | `Shift` + wheel, tilt wheel or two-finger swipe over the block |
-| Copy a code block | Hover it and click **Copy** |
+| Copy a code block, or a diagram's source | Hover it and click **Copy** |
 | Theme picker (live preview) | `Ctrl+T`, then `↑` `↓` to preview, `Enter` to keep, `Esc` to revert |
 | Next / previous theme | `T` / `Shift+T` |
 | Reload file and themes | `F5` (files also reload automatically when saved) |
@@ -225,9 +242,15 @@ Besides unit tests, `src/resilience_tests.rs` checks that no input can crash, ha
 parser, highlighter or rendering engine (a real Direct2D renderer drawing to a hidden window):
 - **Spec corpus:** all 1,324 CommonMark 0.31.2 and GFM 0.29 examples (`tests/fixtures`), each parsed,
   structurally validated, laid out and drawn in every theme, at several zoom levels and window widths.
-- **Pathological inputs:** about 35 generators after cmark's `pathological_tests.py` (nested emphasis,
-  unclosed brackets, backtick runs and so on), plus cases aimed at ƜackDown's own code. Each must
-  finish within a time budget, which catches hangs and super-linear blowups.
+- **Pathological inputs:** about 50 generators after cmark's `pathological_tests.py` (nested emphasis,
+  unclosed brackets, backtick runs and so on), plus cases aimed at ƜackDown's own code, including
+  the Mermaid engine (huge chains, stars, bracket and arrow soups). Each must finish within a time
+  budget, which catches hangs and super-linear blowups.
+- **Diagrams:** `tests/fixtures/mermaid.md` has one of each of the thirteen diagram types plus a
+  broken and an unsupported fence; it is drawn in every theme and at several zooms, copied, and
+  printed to PDF.
+  The engine's own unit tests check layout invariants (edges attach to outlines, clusters contain
+  their members, nothing overlaps) and the size caps.
 - **Mutation fuzzing:** a deterministic fuzzer that mutates spec examples. Failing inputs are saved
   to `target/resilience-failures/`. For a longer run:
   `$env:WACKDOWN_FUZZ_ITERS=100000; cargo test --release --target x86_64-pc-windows-msvc -- mutation_fuzz`

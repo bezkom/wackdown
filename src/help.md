@@ -10,7 +10,7 @@ A native Direct2D Markdown viewer. Drop a `.md` file onto this window, press **C
 | Top / bottom | `Home` / `End` |
 | Zoom, from 4% to 5000% | `Ctrl` + wheel, `Ctrl +` / `Ctrl -`, reset with `Ctrl 0` |
 | Scroll a wide code block sideways | `Shift` + wheel, tilt wheel or two-finger swipe |
-| Copy a code block | Hover it and click **Copy** |
+| Copy a code block or a diagram's source | Hover it and click **Copy** |
 | Theme picker (live preview) | `Ctrl+T`, then `↑` `↓`, `Enter` keep, `Esc` revert |
 | Next / previous theme | `T` / `Shift+T` |
 | Reload file and themes | `F5` (files also reload automatically when saved) |
@@ -32,7 +32,7 @@ Wide window, or zoomed out? The page splits into side-by-side columns that scrol
 
 Files that change on disk are re-read within a second, and what changed is briefly highlighted. If you were at the end of the file, you stay at the end as it grows: open the report an agent is writing and watch it arrive. Every file reopens where you left it.
 
-Local images (`![alt](picture.png)` on a line of its own) are drawn, scaled to the column; remote images show their alt text, because ƜackDown has no network code.
+Local images (`![alt](picture.png)` on a line of its own) are drawn, scaled to the column; remote images show their alt text, because ƜackDown has no network code. Mermaid diagrams are drawn too, with no browser involved: see the tour below.
 
 ## Themes {#themes-section}
 
@@ -91,6 +91,27 @@ fn main() {
 |:-----|:------:|------:|
 | a    | b      | 1.00  |
 | c    | d      | 20.50 |
+
+Mermaid diagrams are drawn, not quoted: flowcharts, sequence, class, state and entity relationship diagrams, Gantt charts, git graphs, mind maps, timelines, user journeys, quadrant, XY and pie charts. Labels can be selected and searched, and hovering a diagram shows its source's **Copy** button.
+
+```mermaid
+flowchart LR
+    A[Markdown file] -->|save| B(ƜackDown)
+    B --> C{Diagram?}
+    C -->|yes| D[Drawn with Direct2D]
+    C -->|no| E[Shown as code]
+```
+
+```mermaid
+sequenceDiagram
+    participant You
+    participant W as ƜackDown
+    You->>+W: open report.md
+    W-->>-You: drawn in milliseconds
+    loop every 0.7 s
+        W->>W: file changed?
+    end
+```
 
 ---
 

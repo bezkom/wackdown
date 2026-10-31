@@ -14,12 +14,12 @@ pub fn selection_html(doc: &Document, layout: &Layout, (s, e): (TextPos, TextPos
         let block = &doc.blocks[i];
         // Single-item blocks map the selection's positions straight onto their text; tables
         // and the like are copied whole.
-        let clips = matches!(
-            block.kind,
-            BlockKind::Paragraph(_) | BlockKind::Heading { .. } | BlockKind::ListItem { .. } | BlockKind::DefinitionTerm(_) | BlockKind::Code { .. }
-        );
-        let from = if clips && i == first && layout.item_block(s.item) == Some(i) { s.pos } else { 0 };
-        let to = if clips && i == last && layout.item_block(e.item) == Some(i) { Some(e.pos) } else { None };
+        let clips_text = matches!(block.kind, BlockKind::Paragraph(_) | BlockKind::Heading { .. } | BlockKind::ListItem { .. } | BlockKind::DefinitionTerm(_));
+        // A code block clips only when the selection end sits in its text; a drawn diagram's
+        // labels are not its source, so the diagram is copied whole.
+        let in_code = |item: usize| matches!(block.kind, BlockKind::Code { .. }) && layout.items.get(item).is_some_and(|it| it.code.is_some());
+        let from = if (clips_text || in_code(s.item)) && i == first && layout.item_block(s.item) == Some(i) { s.pos } else { 0 };
+        let to = if (clips_text || in_code(e.item)) && i == last && layout.item_block(e.item) == Some(i) { Some(e.pos) } else { None };
         w.block(doc, block, from, to);
     }
     w.finish()

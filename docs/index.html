@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ƜackDown — Markdown, turned on its head</title>
-<meta name="description" content="A 3 MB Markdown viewer for Windows that opens before you finish double-clicking. No browser inside, no account, no sidebar that wants to be your friend.">
+<meta name="description" content="A 4 MB Markdown viewer for Windows that opens before you finish double-clicking. No browser inside, no account, no sidebar that wants to be your friend.">
 <meta property="og:title" content="ƜackDown">
 <meta property="og:description" content="Markdown, turned on its head. A native Windows viewer with nothing in it but the viewer.">
 <meta property="og:image" content="https://bezkom.github.io/wackdown/img/theme-cyberpunk-terminal.png">
@@ -143,7 +143,7 @@ footer p { margin: .4em 0; }
   <h1 class="logo"><span class="m">M</span>ackDown<span class="arrow">↓</span></h1>
   <p class="tagline">Markdown, turned on its head.</p>
   <p class="sub">A Markdown viewer for Windows that opens before you've finished double-clicking.
-  Three megabytes. No browser inside. No account. No sidebar that wants to be your friend.</p>
+  Four megabytes, diagrams included. No browser inside. No account. No sidebar that wants to be your friend.</p>
   <div class="cta">
     <a class="btn btn-primary" id="dl" href="https://github.com/bezkom/wackdown/releases/latest">⬇ Download for Windows</a>
     <a class="btn btn-ghost" href="https://github.com/bezkom/wackdown">Source on GitHub</a>
@@ -160,11 +160,12 @@ footer p { margin: .4em 0; }
   <div class="label" aria-label="Nutrition facts, parody">
     <h3>Nutrition Facts</h3>
     <div class="row thick"><span>Serving size</span><b>1 .md file</b></div>
-    <div class="row"><span>Download size</span><b id="dlsize">~3 MB</b></div>
+    <div class="row"><span>Download size</span><b id="dlsize">~4 MB</b></div>
     <div class="row"><span>Browser engines</span><b>0</b></div>
     <div class="row"><span>Background services</span><b>0</b></div>
     <div class="row"><span>Accounts required</span><b>0</b></div>
     <div class="row"><span>Telemetry</span><b>0 g</b></div>
+    <div class="row"><span>JavaScript, for the diagrams</span><b>0</b></div>
     <div class="row"><span>Fonts, embedded</span><b>3 cuts</b></div>
     <div class="row thick"><span>Themes</span><b>8</b></div>
     <div class="fine">Percent daily values are based on a 2,000-tab diet. Contains Rust. Processed on GPUs that also process games.</div>
@@ -213,6 +214,7 @@ footer p { margin: .4em 0; }
       <div class="card"><h3>Opens huge files instantly</h3><p>It lays out only what fits on your screen before the window appears, and does the rest a few milliseconds at a time while you read. The scrollbar politely estimates the length until it knows.</p></div>
       <div class="card"><h3>Draws with the GPU, not a browser</h3><p>Direct2D and DirectWrite, straight from Rust. Every frame is timed to your monitor's refresh rate, so scrolling and zooming feel like they belong to the OS, because they do.</p></div>
       <div class="card"><h3>Eight themes, zero CSS</h3><p>Cyberpunk Terminal, Tokyo Dusk, Monokai Pro Rust, Nordic Fjord, Solarized Deep Dark and Paper &amp; Gutenberg, plus Monochrome Light and Dark for boring people. The picker can follow the Windows light/dark setting. Write your own in a few lines of JSON.</p></div>
+      <div class="card"><h3>Diagrams, without a browser</h3><p>A <code>```mermaid</code> fence becomes a drawing: flowcharts, sequence, class, state and ER diagrams, Gantt charts, git graphs, mind maps, timelines, journeys, quadrant, XY and pie charts. Laid out by a few thousand lines of Rust instead of a JavaScript engine, in your theme's colors, as sharp at 5,000% as at 100%. Anything it doesn't understand stays a code block.</p></div>
       <div class="card"><h3>Pictures, finally</h3><p>Local PNG, JPEG, GIF, BMP and WebP are drawn with the Windows imaging codecs and scaled to the column. Remote images show their alt text, because there is no network code to fetch them with.</p></div>
       <div class="card"><h3>Built for agent output</h3><p>A file that is still being written reloads as it grows, the blocks that changed light up for a moment, and if you were at the end you stay at the end. Every file reopens where you left it. <kbd>Ctrl</kbd> <kbd>Shift</kbd> <kbd>A</kbd> keeps the window above your editor.</p></div>
       <div class="card"><h3>Prints. To paper, or to PDF.</h3><p><kbd>Ctrl</kbd> <kbd>P</kbd> opens the Windows print dialog; pick <i>Microsoft Print to PDF</i> and you have a PDF. Pages break between blocks, dark themes print in grayscale, and no browser was harmed.</p></div>
@@ -220,8 +222,19 @@ footer p { margin: .4em 0; }
       <div class="card"><h3>Reloads when you save</h3><p>Keep your real editor open next to it. Hit save, and ƜackDown has already redrawn by the time you look over. No "file changed on disk" dialog, because what else would you want?</p></div>
       <div class="card"><h3>Code blocks that respect identifiers</h3><p>Long lines scroll sideways instead of wrapping in the middle of <code>Api.Integrators</code>. Syntax colors for a dozen languages. A Copy button appears when you hover, then goes away again.</p></div>
       <div class="card"><h3>Math, within reason</h3><p>TeX becomes Unicode: <code>$E = mc^2$</code> renders as E = mc², <code>\alpha \leq \beta</code> as α ≤ β. Matrices and other things Unicode can't say are shown as source, honestly, instead of wrong.</p></div>
-      <div class="card"><h3>The extensions people actually use</h3><p>Tables, task lists, footnotes that link both ways, callouts with real icons, definition lists, <code>[[wiki links]]</code>, H~2~O, 2^10^, <code>{#custom-ids}</code>. Mermaid diagrams are shown as code. We're sorry. We're not that sorry.</p></div>
+      <div class="card"><h3>The extensions people actually use</h3><p>Tables, task lists, footnotes that link both ways, callouts with real icons, definition lists, <code>[[wiki links]]</code>, H~2~O, 2^10^, <code>{#custom-ids}</code>. And Mermaid, which used to be shown as code. We said we weren't sorry. We were a little sorry.</p></div>
       <div class="card"><h3>Keyboard first</h3><p>Everything is a key away: zoom, themes, back, select all, copy, a help page on <kbd>F1</kbd>. The mouse is welcome too. It just isn't required.</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="narrow">
+    <h2><span class="hash">#</span>Diagrams, drawn by hand</h2>
+    <p class="dim">Every Mermaid viewer you've met runs a browser to draw a box with an arrow. This one measures the labels with DirectWrite, lays the graph out itself and hands Direct2D some lines. Zoom in; the arrows stay arrows.</p>
+    <div class="shot">
+      <div class="bar"><i></i><i></i><i></i><span>diagrams.md — ƜackDown · Tokyo Dusk</span></div>
+      <img src="img/diagrams.png" width="1000" height="721" loading="lazy" alt="ƜackDown drawing a Mermaid flowchart, a sequence diagram and a pie chart in the Tokyo Dusk theme">
     </div>
   </div>
 </section>
@@ -233,7 +246,7 @@ footer p { margin: .4em 0; }
     <div class="bars">
       <div class="bar-row"><span>Apollo guidance computer, total memory</span><div class="fill"><i style="--w: .2%"></i></div><span class="n">72 KB</span></div>
       <div class="bar-row"><span>A floppy disk</span><div class="fill"><i style="--w: 1.2%"></i></div><span class="n">1.44 MB</span></div>
-      <div class="bar-row us"><span>ƜackDown, fonts included</span><div class="fill"><i style="--w: 2.5%"></i></div><span class="n">3.2 MB</span></div>
+      <div class="bar-row us"><span>ƜackDown, fonts included</span><div class="fill"><i style="--w: 3%"></i></div><span class="n">3.9 MB</span></div>
       <div class="bar-row"><span>Windows 95, the whole operating system</span><div class="fill"><i style="--w: 40%"></i></div><span class="n">~50 MB</span></div>
       <div class="bar-row"><span>A typical "lightweight" note app</span><div class="fill"><i style="--w: 100%"></i></div><span class="n">~250 MB*</span></div>
     </div>
@@ -275,7 +288,8 @@ footer p { margin: .4em 0; }
     <details><summary>Windows says it doesn't recognize this app.</summary><p>Correct, and Windows is being honest: the files aren't code-signed yet, because certificates cost either money or reputation and we're starting with neither. Click <em>More info → Run anyway</em>, or verify the SHA-256 checksum published with every release, like the responsible adult you are. Starring the repo helps us qualify for free signing. That's not a joke; it's literally how the program works.</p></details>
     <details><summary>Where does it keep my settings?</summary><p>One tiny JSON file in <code>%APPDATA%\WackDown</code> that remembers your theme, zoom, window size, whether you pinned it on top, and where you were in the last hundred files. Drop your own themes in a folder next to it. That's the whole configuration story.</p></details>
     <details><summary>How far can I zoom?</summary><p>From 4%, where a document becomes a mood, to 5,000%, where a comma becomes a landscape. Most apps stop at 200% because nobody asked. We asked. There's something waiting for you at both ends.</p></details>
-    <details><summary>Does it support images?</summary><p>Local ones, yes: PNG, JPEG, GIF, BMP, WebP, decoded by Windows and scaled to the column. Remote ones show their alt text, because there is no network code. Mermaid diagrams are shown as code, which is technically rendering.</p></details>
+    <details><summary>Does it support images?</summary><p>Local ones, yes: PNG, JPEG, GIF, BMP, WebP, decoded by Windows and scaled to the column. Remote ones show their alt text, because there is no network code.</p></details>
+    <details><summary>And Mermaid diagrams?</summary><p>Drawn, since 1.5. Thirteen diagram types, laid out by hand-written Rust with no browser, no JavaScript and no new dependency, in the colors of whatever theme you're using. The labels are real text, so you can select them, search them and copy the source with one hover. A diagram ƜackDown can't parse is shown as the code block it is, which is what every other viewer does with all of them.</p></details>
     <details><summary>Who wrote this?</summary><p>An AI coding assistant (Claude Code), with a human holding the leash, reviewing the work and making the rude design decisions. The code is GPL-3.0, so you can read every line and judge for yourself.</p></details>
   </div>
 </section>

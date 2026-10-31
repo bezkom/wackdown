@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use windows::core::w;
 use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP};
 
@@ -55,7 +56,32 @@ fn corpus() -> Vec<(String, String)> {
         assert!(examples.len() > 600, "{file}: suspiciously few examples ({})", examples.len());
         out.extend(examples.into_iter().map(|e| (format!("{tag}#{} ({})", e.example, e.section), e.markdown)));
     }
+    // Every fenced block of the Mermaid fixture, so the fuzzer mutates real diagrams too.
+    let mermaid = std::fs::read_to_string(fixture("mermaid.md")).unwrap_or_else(|e| panic!("missing fixture mermaid.md: {e}"));
+    for (i, block) in mermaid.split("```mermaid\n").skip(1).enumerate() {
+        let body = block.split("```").next().unwrap_or("");
+        out.push((format!("mermaid#{i}"), format!("```mermaid\n{body}```\n")));
+    }
     out
+}
+
+/// Runs every ```mermaid fence of a document through the engine within a time budget and checks
+/// the scenes it accepts.
+fn check_mermaid(doc: &Document, ctx: &str) {
+    for block in &doc.blocks {
+        let BlockKind::Code { lang, code } = &block.kind else { continue };
+        if !lang.eq_ignore_ascii_case("mermaid") {
+            continue;
+        }
+        let code = code.clone();
+        let label = ctx.to_string();
+        within(ctx, Duration::from_secs(2) * slack(), move || {
+            let params = crate::mermaid::testing::params();
+            if let Ok(scene) = crate::mermaid::render(&code, &params, &mut crate::mermaid::testing::fake_measure) {
+                crate::mermaid::testing::check_scene(&scene, &label);
+            }
+        });
+    }
 }
 
 /// Speed factor for time budgets: unoptimized test builds are much slower.
@@ -128,7 +154,7 @@ fn check_highlight(lang: &str, code: &str, ctx: &str) {
     }
 }
 
-const LANGS: [&str; 12] = ["", "rust", "py", "sh", "sql", "json", "html", "css", "bat", "yaml", "c", "made-up-lang"];
+const LANGS: [&str; 13] = ["", "rust", "py", "sh", "sql", "json", "html", "css", "bat", "yaml", "c", "made-up-lang", "mermaid"];
 
 /// Everything the renderer relies on about a parsed document.
 fn check_doc(doc: &Document, input: &str, ctx: &str) {
@@ -248,6 +274,13 @@ impl Harness {
         {
             let layout = self.renderer.layout().expect("layout");
             assert_eq!(layout.block_y(layout.block_at(0.0)), 0.0, "{ctx}: top anchor drifted");
+            // Diagrams never leave the column and always have a drawable rectangle.
+            for d in &layout.decos {
+                if let crate::layout::Deco::Diagram { rect, .. } = &d.deco {
+                    assert!(rect.left.is_finite() && rect.top.is_finite() && rect.right.is_finite() && rect.bottom.is_finite(), "{ctx}: diagram rect {rect:?}");
+                    assert!(rect.right - rect.left <= layout.column_w + 0.5 && rect.bottom >= rect.top, "{ctx}: diagram rect {rect:?} in column {}", layout.column_w);
+                }
+            }
         }
 
         // Ctrl+F: every match must be a forward range inside one item.
@@ -460,6 +493,20 @@ fn pathological_cases(n: usize) -> Vec<(&'static str, String)> {
         ("heading attributes", r("# h {#id .c key=v}\n", n)),
         ("definition list storm", r("Term\n: def\n: def\n\n", n)),
         ("nested definitions", (0..n.min(200)).map(|i| format!("{}Term\n{}: def\n", "  ".repeat(i), "  ".repeat(i))).collect()),
+        // Mermaid
+        ("mermaid long chain", format!("```mermaid\ngraph LR\n{}\n```", (0..n.min(3_000)).map(|i| format!("a{i} --> a{}", i + 1)).collect::<Vec<_>>().join("\n"))),
+        ("mermaid star", format!("```mermaid\ngraph TD\n{}\n```", (0..n.min(3_000)).map(|i| format!("hub --> n{i}")).collect::<Vec<_>>().join("\n"))),
+        ("mermaid bipartite", format!("```mermaid\ngraph TD\n{} --> {}\n```", (0..60).map(|i| format!("a{i}")).collect::<Vec<_>>().join(" & "), (0..60).map(|i| format!("b{i}")).collect::<Vec<_>>().join(" & "))),
+        ("mermaid fence storm", r("```mermaid\ngraph TD\nA-->B\n```\n", n / 10)),
+        ("mermaid deep subgraphs", format!("```mermaid\ngraph TD\n{}A-->B\n{}```", r("subgraph s\n", n.min(500)), r("end\n", n.min(500)))),
+        ("mermaid unterminated fence", format!("```mermaid\ngraph TD\n{}", r("A-->B\n", n))),
+        ("mermaid one huge label", format!("```mermaid\ngraph TD\nA[{}]\n```", "x".repeat(n * 20))),
+        ("mermaid pie with many slices", format!("```mermaid\npie\n{}```", (0..n).map(|i| format!("\"s{i}\" : {i}\n")).collect::<String>())),
+        ("mermaid sequence with many participants", format!("```mermaid\nsequenceDiagram\n{}```", (0..n.min(3_000)).map(|i| format!("p{i}->>p{}: m\n", i + 1)).collect::<String>())),
+        ("mermaid class with many members", format!("```mermaid\nclassDiagram\nclass A {{\n{}}}\n```", r("+f()\n", n))),
+        ("mermaid state nesting", format!("```mermaid\nstateDiagram-v2\n{}a --> b\n{}```", r("state s {\n", n.min(500)), r("}\n", n.min(500)))),
+        ("mermaid bracket soup", format!("```mermaid\ngraph TD\nA{}B\n```", r("[(", n))),
+        ("mermaid arrow soup", format!("```mermaid\ngraph TD\nA {} B\n```", r("-", n))),
     ]
 }
 
@@ -623,6 +670,62 @@ fn local_images_are_drawn_and_missing_ones_fall_back_to_alt_text() {
 }
 
 #[test]
+fn mermaid_diagrams_are_drawn_and_bad_ones_stay_code() {
+    let path = fixture("mermaid.md");
+    let doc = parse_file_to_document(&path).unwrap();
+    let mut h = Harness::new(900, 7200);
+    h.exercise(&doc, 0, 1.0, "mermaid");
+    let layout = h.renderer.layout().unwrap();
+    let diagrams: Vec<D2D_RECT_F> = layout.decos.iter().filter_map(|d| match &d.deco { crate::layout::Deco::Diagram { rect, .. } => Some(*rect), _ => None }).collect();
+    let column = layout.column_w;
+    for r in &diagrams {
+        assert!(r.left.is_finite() && r.right.is_finite() && r.top.is_finite() && r.bottom.is_finite(), "{r:?}");
+        assert!(r.right - r.left <= column + 0.5 && r.bottom > r.top, "diagram fits the column: {r:?} in {column}");
+    }
+    assert!(diagrams.windows(2).all(|w| w[1].top >= w[0].bottom), "diagrams stack in order: {diagrams:?}");
+    assert_eq!(layout.codes.len(), 16, "every fence has a Copy button");
+    assert_eq!(diagrams.len(), 14, "fourteen diagrams drawn, a broken and an unsupported fence stay code");
+    let drawn = layout.codes.iter().filter(|c| c.source.is_some()).count();
+    assert_eq!(drawn, diagrams.len(), "one copy box per drawn diagram");
+    for (c, code) in layout.codes.iter().enumerate() {
+        let text = layout.code_text(c).unwrap();
+        assert!(!text.replace("\r\n", "").contains('\n'), "bare LF in clipboard text: {text:?}");
+        if let Some(src) = &code.source {
+            assert_eq!(text, src.replace('\n', "\r\n"));
+        }
+    }
+    let texts: Vec<String> = layout.items.iter().map(|it| String::from_utf16_lossy(&it.text)).collect();
+    assert!(texts.iter().any(|t| t.contains("Reading")), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "Text after."));
+    let sel = layout.select_all().unwrap();
+    let html = crate::html::selection_html(&doc, layout, sel);
+    assert_eq!(html.matches("language-mermaid").count(), 16, "{html}");
+    assert!(html.contains("A --&gt;\n[[["), "broken source copied verbatim: {html}");
+    let snap = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("snapshots");
+    let pal = h.themes[0].palette();
+    h.renderer.snapshot_bmp(&pal, &ViewState { scroll: 0.0, ..Default::default() }, &snap.join("diagrams.bmp")).unwrap();
+    for (i, theme) in h.themes.clone().iter().enumerate().skip(1) {
+        h.exercise(&doc, i, 1.0, &format!("mermaid in {}", theme.name));
+    }
+    let mono = h.themes.iter().position(|t| t.id == "monochrome-light").unwrap();
+    h.exercise(&doc, mono, 1.0, "mermaid monochrome");
+    let pal = h.themes[mono].palette();
+    h.renderer.snapshot_bmp(&pal, &ViewState { scroll: 0.0, ..Default::default() }, &snap.join("diagrams-monochrome-light.bmp")).unwrap();
+    // Zoom: a diagram narrower than the column scales with the text; wider ones still fit.
+    h.exercise(&doc, 0, 0.5, "mermaid at 50%");
+    let layout = h.renderer.layout().unwrap();
+    let small: Vec<f32> = layout.decos.iter().filter_map(|d| match &d.deco { crate::layout::Deco::Diagram { rect, .. } => Some(rect.right - rect.left), _ => None }).collect();
+    for (a, b) in diagrams.iter().map(|r| r.right - r.left).zip(&small) {
+        assert!(*b <= a + 0.5, "smaller at 50%: {a} -> {b}");
+    }
+    h.exercise(&doc, 0, 3.0, "mermaid at 300%");
+    let layout = h.renderer.layout().unwrap();
+    for r in layout.decos.iter().filter_map(|d| match &d.deco { crate::layout::Deco::Diagram { rect, .. } => Some(*rect), _ => None }) {
+        assert!(r.right - r.left <= layout.column_w + 0.5, "{r:?}");
+    }
+}
+
+#[test]
 fn selection_html_clips_to_the_selected_text() {
     let doc = parse_markdown("# Title\n\nFirst **bold** paragraph.\n\n- one\n- two\n\n```rust\nfn a() {}\nfn b() {}\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n");
     let mut h = Harness::new(800, 600);
@@ -640,8 +743,12 @@ fn selection_html_clips_to_the_selected_text() {
 
 /// Prints the help page into a stream through "Microsoft Print to PDF" (the real Direct2D print
 /// pipeline, no dialog) and keeps the result at target/snapshots/print.pdf for a human to open.
+/// Microsoft Print to PDF rejects a second job while one is spooling, so the print tests take turns.
+static PRINT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn prints_to_a_pdf_stream() {
+    let _one_at_a_time = PRINT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use windows::Win32::Foundation::HGLOBAL;
     use windows::Win32::System::Com::StructuredStorage::{CreateStreamOnHGlobal, GetHGlobalFromStream};
     use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
@@ -678,8 +785,43 @@ fn prints_to_a_pdf_stream() {
     eprintln!("{pages} pages, {} bytes of PDF", bytes.len());
 }
 
+#[test]
+fn mermaid_fixture_prints_to_pdf() {
+    let _one_at_a_time = PRINT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::Com::StructuredStorage::{CreateStreamOnHGlobal, GetHGlobalFromStream};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    let doc = parse_file_to_document(&fixture("mermaid.md")).unwrap();
+    let mut h = Harness::new(800, 600);
+    let theme = h.themes.iter().find(|t| t.id == crate::theme::PRINT_THEME_ID).unwrap().clone();
+    let pal = theme.palette();
+    let printer = PrinterChoice::letter("Microsoft Print to PDF");
+    let stream = unsafe { CreateStreamOnHGlobal(HGLOBAL::default(), true) }.unwrap();
+    let pages = match h.renderer.print_to(&printer, Some(&stream), &doc, &theme, &pal, "mermaid.md") {
+        Ok(pages) => pages,
+        Err(e) if std::env::var_os("CI").is_some() => {
+            eprintln!("skipped: Microsoft Print to PDF unavailable ({e})");
+            return;
+        }
+        Err(e) => panic!("print failed: {e}"),
+    };
+    assert!(pages >= 1);
+    let bytes = unsafe {
+        let global = GetHGlobalFromStream(&stream).unwrap();
+        let size = GlobalSize(global);
+        let ptr = GlobalLock(global) as *const u8;
+        let bytes = std::slice::from_raw_parts(ptr, size).to_vec();
+        let _ = GlobalUnlock(global);
+        bytes
+    };
+    assert!(bytes.starts_with(b"%PDF"), "expected a PDF, got {:?}", bytes.get(..8));
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("snapshots");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("print-mermaid.pdf"), &bytes).unwrap();
+}
+
 /// Renders the website gallery pictures offscreen: the two monochrome themes and the theme picker
-/// (with its "Follow Windows" row) on docs/hero.md at the gallery's 1000x721.
+/// (with its "Follow Windows" row) on docs/hero.md, and docs/diagrams.md, at the gallery's 1000x721.
 #[test]
 fn gallery_snapshots() {
     let hero = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs").join("hero.md")).unwrap();
@@ -707,6 +849,14 @@ fn gallery_snapshots() {
     h.renderer.finish_layout(&doc).unwrap();
     let view = ViewState { scroll: 0.0, switcher: Some(SwitcherView { entries: &entries, selected: 1, hover: None, stats: None }), ..Default::default() };
     h.renderer.snapshot_bmp(&pal, &view, &dir.join("picker.bmp")).unwrap();
+    // The diagrams picture: docs/diagrams.md in Tokyo Dusk, drawn without the picker.
+    let diagrams = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs").join("diagrams.md")).unwrap();
+    let doc = parse_markdown(&diagrams);
+    let theme = h.themes.iter().find(|t| t.id == "tokyo-dusk").unwrap().clone();
+    let pal = theme.palette();
+    h.renderer.ensure_layout(&doc, &theme, &pal, 1, 10, 1.0, f32::MAX, usize::MAX, Duration::from_secs(30)).unwrap();
+    h.renderer.finish_layout(&doc).unwrap();
+    h.renderer.snapshot_bmp(&pal, &ViewState { scroll: 0.0, ..Default::default() }, &dir.join("diagrams.bmp")).unwrap();
 }
 
 #[test]
@@ -742,6 +892,8 @@ impl Rng {
 }
 
 const TOKENS: &[&str] = &[
+    "```mermaid\n", "graph TD\n", "flowchart LR\n", "sequenceDiagram\n", "classDiagram\n", "stateDiagram-v2\n", "pie\n", "-->", "-->|x|", "-.->", "==>", "->>", "-x", "-)",
+    "subgraph ", "end\n", "[*]", "<|--", "*--", "..>", "[(", "((", "{{", "[/", ":::", "state ", "loop ", "alt ", "else\n", "Note over ", "participant ", "\"a\" : 1\n", "%% ", "<br>",
     "*", "**", "_", "__", "`", "``", "```", "~~~", "~~", "[", "]", "(", ")", "![", "](", "<", ">", "> ", "- ", "* ", "+ ",
     "1. ", "1) ", "#", "# ", "####### ", "|", "|---|", ":-:", "\\", "&amp;", "&#", "&#x", "<!--", "-->", "<div>", "</div>",
     "<br>", "\n", "\n\n", "    ", "\t", "[^1]", "[^1]: ", "- [ ] ", "- [x] ", "> [!NOTE]\n", "> [!CAUTION]\n", "---\n",
@@ -815,6 +967,7 @@ fn mutation_fuzz_parser_highlighter_and_renderer() {
         guarded(&label, &input, || {
             let doc = parse_markdown(&input);
             check_doc(&doc, &input, &label);
+            check_mermaid(&doc, &label);
             let lang = LANGS[i % LANGS.len()];
             check_highlight(lang, &input, &label);
             // Rendering is slower; sample it.
